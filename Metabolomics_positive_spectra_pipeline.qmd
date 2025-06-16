@@ -1,0 +1,904 @@
+---
+title: "metab"
+format: html
+editor: visual
+---
+
+## Positive mode
+
+Load the required R packages and the positive ion mode metabolomics dataset.\
+
+Load metabolomic data for positive ion mode. Set up consistent variable names to avoid overwriting issues later in the pipeline.
+
+```{r}
+# Load required packages
+library(pmp)
+library(SummarizedExperiment)
+library(dplyr)
+library(ggplot2)
+
+# Load data
+load("metabolomics_pos.RData")
+
+# Re-assign to new variable names to avoid overwrite issues
+features_info_pos <- features_info
+samples_info_pos <- samples_info
+colnames(features_info_pos)
+
+```
+
+Clean sample info and align metadata with the intensity matrix.
+
+Build Summarized Experiment object for structured downstream analysis.
+
+QC replicates "QC31", "QC32", "QC5_2" are in the data matrix but not in samples info (positive), therefore they were removed
+
+```{r}
+# Clean sample info to match data matrix
+data_pos <- data_pos[, !(colnames(data_pos) %in% c("QC31", "QC32", "QC5_2"))]
+samples_info_pos <- samples_info_pos[
+  match(colnames(data_pos), samples_info_pos$id),
+]
+stopifnot(all(colnames(data_pos) == samples_info_pos$id))  # Must be TRUE
+
+# Align rownames
+rownames(features_info_pos) <- rownames(data_pos)
+rownames(samples_info_pos) <- colnames(data_pos)
+
+# Create SummarizedExperiment object
+se_raw <- SummarizedExperiment(
+  assays = list(counts = as.matrix(data_pos)),
+  rowData = features_info_pos,
+  colData = samples_info_pos
+)
+
+
+
+
+```
+
+### Perform multi-step feature filtering:
+
+Removing samples with too many missing values.
+
+Keeping features detected in 90% of QC samples and all samples.
+
+Removing unstable features with high RSD in QCs.
+
+```{r}
+# Filter: features in ≥90% of QC samples
+se_filt_qc <- filter_peaks_by_fraction(
+  df = se_raw,
+  min_frac = 0.9,
+  classes = se_raw$strain,
+  method = "QC",
+  qc_label = "QCs"
+)
+
+
+# Filter: remove features with RSD > 30% in QC
+se_filt_rsd <- filter_peaks_by_rsd(
+  df = se_filt_qc,
+  max_rsd = 30,
+  classes = se_filt_qc$strain,
+  qc_label = "QCs"
+)
+```
+
+PQN normalisation using QC samples as reference
+
+Imputing missing values with KNN
+
+Apply GLOG transformation to stabilize variance across intensities.
+
+```{r}
+# PQN Normalisation
+se_pqn <- pqn_normalisation(
+  df = se_filt_rsd,
+  classes = se_filt_rsd$strain,
+  qc_label = "QCs"
+)
+
+# Missing value imputation (KNN)
+se_imputed <- mv_imputation(
+  df = se_pqn,
+  method = "knn"
+)
+
+# Save pre-GLOG version for comparison
+se_pre_glog <- se_imputed  # 📌 This is our "before" snapshot
+
+# GLOG Transformation
+se_glog <- glog_transformation(
+  df = se_imputed,
+  classes = se_imputed$strain,
+  qc_label = "QCs"
+)
+
+```
+
+#### Visualising the transformations
+
+Visualize optimal lambda for GLOG and histograms of intensity distributions before and after transformation.
+
+Shows how the Sum of Squared Errors (SSE) changes with different lambda values used in the GLOG transformation, helping to identify the most variance-stabilizing parameter
+
+```{r}
+
+# Visualize lambda optimization
+opt_lambda <- processing_history(se_glog)$glog_transformation$lambda_opt
+glog_plot_optimised_lambda(
+  df = se_glog,
+  optimised_lambda = opt_lambda,
+  classes = se_pre_glog$strain,
+  qc_label = "QCs"
+)
+
+# Histograms: Before vs After GLOG
+par(mfrow = c(1, 2))
+hist(assay(se_pre_glog),
+     breaks = 100, main = "Before GLOG", xlab = "Intensity", col = "tomato")
+hist(assay(se_glog),
+     breaks = 100, main = "After GLOG", xlab = "Transformed Intensity", col = "steelblue")
+
+```
+
+Transformation structure checks for further analysis
+
+```{r}
+# colnames(se_glog)
+# rownames(se_glog)
+# colnames(samples_info_pos)
+```
+
+### PCA
+
+Load PCA libraries
+
+```{r}
+# Ensure necessary libraries are installed and loaded
+if (!requireNamespace("pmp", quietly = TRUE)) install.packages("pmp")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("ggfortify", quietly = TRUE)) install.packages("ggfortify")
+
+```
+
+##### Full Data PCA
+
+Run PCA on normalised data to explore clustering, using metadata for visual grouping
+
+```{r}
+
+library(pmp)
+library(ggplot2)
+library(ggfortify)
+
+# Assuming 'se_pos' is your SummarizedExperiment object after preprocessing
+# Extract the assay data
+data_matrix <- assay(se_glog)
+
+# Perform PCA
+pca_results <- prcomp(t(data_matrix), center = TRUE, scale. = TRUE)
+
+# Create a data frame with PCA results and sample information
+pca_data <- data.frame(
+  PC1 = pca_results$x[, 1],
+  PC2 = pca_results$x[, 2],
+  Strain = se_glog$strain,
+  Next2 = se_glog$Next2,
+  Day = se_glog$day
+)
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Strain, shape = Next2)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA of Metabolomics Data",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+```
+
+### Strain A next2 C vs B
+
+Focusing on specific conditions
+
+```{r}
+# Load libraries (assumed already loaded earlier in pipeline)
+library(FactoMineR)
+library(factoextra)
+library(ggplot2)
+
+# Subset samples: Strain A with Next2 = B or C
+idx_subset_pos <- which(se_glog$strain == "A" & se_glog$Next2 %in% c("B", "C"))
+se_pos_subset <- se_glog[, idx_subset_pos]
+
+# Prepare data and metadata
+expr_pos_sub <- t(assay(se_pos_subset))                      # Transpose: samples = rows
+meta_pos_sub <- as.data.frame(colData(se_pos_subset))       # Sample metadata
+
+# Run PCA
+pca_pos_res <- PCA(expr_pos_sub, graph = FALSE)
+explained_var_pos <- round(pca_pos_res$eig[1:2, 2], 1)       # PC1 and PC2 variance %
+
+# Format PCA coordinates with metadata
+pca_coords_pos <- data.frame(pca_pos_res$ind$coord)
+pca_coords_pos$Next2 <- meta_pos_sub$Next2
+pca_coords_pos$Day <- meta_pos_sub$day
+
+
+ggplot(pca_coords_pos, aes(x = Dim.1, y = Dim.2, color = Next2, shape = Day)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("B" = "red", "C" = "blue")) +  # Flip the default colors
+  labs(
+    title = "PCA - Strain A (Next2 B vs C, Positive Mode)",
+    x = paste0("PC1 (", explained_var_pos[1], "%)"),
+    y = paste0("PC2 (", explained_var_pos[2], "%)")
+  ) +
+  theme_minimal()
+
+```
+
+### Likelihood ratio test (LRT)
+
+Prepare data for LRT: Extract metadata and expression data, ensure variables are factors.
+
+Run LRT per feature comparing full vs reduced models.
+
+Adjust p-values (FDR) and identify top features.
+
+```{r}
+# Install necessary packages (if not already installed)
+if (!requireNamespace("lmtest", quietly = TRUE)) install.packages("lmtest")
+
+# Load libraries
+library(lmtest)
+library(SummarizedExperiment)
+library(dplyr)
+
+```
+
+# Likelihood Ratio Testing
+
+Preparing data and running for looped LRT
+
+Question: Does adding Next2 to the model explain significantly more variation in intensity than day alone?
+
+-   Nested model: `intensity ~ day`
+-   Complex model: `intensity ~ Next2 + day`
+
+### 1. **Subset the Data:**
+
+```{r}
+# Extract relevant samples: strain A with Next2 in B or C
+idx <- which(colData(se_glog)$strain == "A" & colData(se_glog)$Next2 %in% c("B", "C"))
+se_subset <- se_glog[, idx]
+```
+
+### 2. **Initialize Results Table:**
+
+Prepare an empty `data.frame` to store the following for each metabolite:
+
+-   Metabolite name
+
+-   P-value from LRT
+
+-   Chi-squared statistic
+
+-   Degrees of freedom
+
+-   Log-likelihood of nested model
+
+-   Log-likelihood of complex model
+
+```{r}
+lrt_results <- data.frame(
+  metabolite = rownames(se_subset),
+  p_value = NA_real_, 
+  chisq = NA_real_,
+  df = NA_integer_,
+  logLik_nested = NA_real_,
+  logLik_complex = NA_real_,
+  stringsAsFactors = FALSE
+)
+```
+
+### **For Each Metabolite: Fit Two Models and Compare**
+
+For each metabolite (row of `se_subset`):
+
+-   Extract the intensity values across all selected samples.
+
+-   Create a model frame including:
+
+    -`day` (experimental time point)
+
+    `-Next2` (group: B or C)
+
+    Then fit two models:
+
+<!-- -->
+
+-   Nested Model: `intensity ~ day`
+
+-   Complex Model: `intensity ~ Next2 + day`
+
+    Perform a Likelihood Ratio Test (`lrtest`) to see if including `Next2` improves the model significantly.
+
+-   `tryCatch` is used to handle metabolites that might fail to fit a model (e.g., due to too many missing values).
+
+-   Chi-squared statistic tests if the more complex model fits significantly better.
+
+```{r}
+for (i in seq_len(nrow(se_subset))) {
+  metab_id <- rownames(se_subset)[i]
+  intensity <- assay(se_subset)[i, ]
+  
+  model_df <- data.frame(
+    intensity = intensity,
+    day = colData(se_subset)$day,
+    Next2 = colData(se_subset)$Next2
+  )
+  
+  tryCatch({
+    nested <- glm(intensity ~ day, data = model_df)
+    complex <- glm(intensity ~ Next2 + day, data = model_df)
+    
+    lrt <- lrtest(nested, complex)
+    
+    lrt_results$p_value[i] <- lrt$`Pr(>Chisq)`[2]
+    lrt_results$chisq[i] <- lrt$Chisq[2]
+    lrt_results$df[i] <- lrt$Df[2]
+    lrt_results$logLik_nested[i] <- as.numeric(logLik(nested))
+    lrt_results$logLik_complex[i] <- as.numeric(logLik(complex))
+    
+  }, error = function(e) {
+    lrt_results$p_value[i] <- NA
+  })
+}
+
+```
+
+### 4. **Adjust P-values for Multiple Testing:**
+
+Use False Discovery Rate (FDR) correction to adjust for multiple comparisons across metabolites.
+
+```{r}
+# Adjust p-values
+lrt_results$adj_p_value <- p.adjust(lrt_results$p_value, method = "fdr")
+
+```
+
+### 5. **Summarize and View Results:**
+
+-   Round numerical values for readability.
+
+-   Sort by adjusted p-value to identify the most significant metabolites.
+
+```{r}
+# Round and arrange
+lrt_table <- lrt_results %>%
+  mutate(across(c(p_value, adj_p_value, chisq, logLik_nested, logLik_complex), round, digits = 8)) %>%
+  arrange(adj_p_value)
+
+# View top 10 as a summary table
+print(head(lrt_table, 10))
+
+```
+
+#### Visualising output
+
+Chisquared values vs pvalues
+
+-   X-axis: The LRT Chi-squared statistic.
+
+-   Y-axis: −log10(p-value) from the same test.
+
+    This visualizes the strength of the test:
+
+-   Higher Chi-squared = stronger statistical evidence against the null model.
+
+-   Higher −log10(p-value) = higher statistical significance.
+
+-   It gives a sanity check: strong chi-sq should correspond to low p-values (upper right corner).
+
+    **Confirms the LRT workflow is robust and behaved as expected**
+
+```{r}
+ggplot(lrt_results, aes(x = chisq, y = -log10(p_value))) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "LRT Statistics per Metabolite",
+       x = "Chi-squared Statistic",
+       y = "-log10(p-value)")
+
+```
+
+### Preparing results for post analysis
+
+-   Convert the `lrt_results` object fully into a `data.frame`.
+
+-   Rename key columns
+
+```{r}
+colnames(lrt_results)
+# Fully convert to base data.frame
+lrt_subset_df <- as.data.frame(lrt_results) %>%
+  dplyr::rename(
+    Feature = metabolite,
+    LRT_pvalue = p_value,
+    adj_pval = adj_p_value
+  )
+```
+
+-   Transpose the expression matrix (Rows = samples, Columns = features (metabolites))
+
+-   Ensure column names match feature IDs.
+
+-   Extract a clean metadata table for these samples.
+
+```{r}
+# Get expression matrix from se_subset
+expr_cols <- t(assay(se_subset))  # transpose: samples as rows
+colnames(expr_cols) <- rownames(se_subset)  # makes features = column names
+# Metadata for those samples
+df_subset_clean <- as.data.frame(colData(se_subset))
+
+
+
+```
+
+### **Check Feature Overlap Between LRT Results and Expression Matrix**
+
+-   Sanity check: ensure features from LRT results are present in the expression matrix.
+
+-   This prevents downstream errors when calculating fold-changes.
+
+```{r}
+# Check overlap
+intersected_features <- intersect(lrt_subset_df$Feature, colnames(expr_cols))
+
+# Sanity check
+length(intersected_features)  # should be > 0
+
+```
+
+### **Calculate Fold Changes (Group C vs Group B)**
+
+For each intersected feature:
+
+-   Compute the **mean intensity** for samples where `Next2 == "C"`.
+
+-   Compute the **mean intensity** for samples where `Next2 == "B"`.
+
+-   Subtract the means to get a simple **fold change** (C − B).
+
+```{r}
+
+# Now safely calculate fold changes
+fc_vals <- sapply(intersected_features, function(feat) {
+  mean(expr_cols[df_subset_clean$Next2 == "C", feat]) - 
+  mean(expr_cols[df_subset_clean$Next2 == "B", feat])
+})
+
+```
+
+### **Verify Feature Matching**
+
+Confirming the features (metabolite IDs) from the lrt match the features available in the expression matrix (`expr_cols`).
+
+```{r}
+# head(lrt_subset_df$Feature)
+# head(rownames(se_subset))
+# head(colnames(expr_cols))  # These should match lrt_subset_df$Feature
+
+expr_cols <- t(assay(se_subset))  # samples = rows, features = columns
+colnames(expr_cols) <- rownames(se_subset)  # features = original metabolite names
+intersected_features <- intersect(lrt_subset_df$Feature, colnames(expr_cols))
+length(intersected_features)
+
+```
+
+### **Prepare Clean Data Structures**
+
+The expression matrix is correctly formatted as a `data.frame` (not a matrix).
+
+Sample metadata (`Next2` groups) is ready for subsetting during fold-change calculation.
+
+```{r}
+expr_cols <- as.data.frame(t(assay(se_subset)))  # transpose + coerce to data frame
+colnames(expr_cols) <- rownames(se_subset)       # features = column names
+
+df_subset_clean <- as.data.frame(colData(se_subset))  # sample metadata
+```
+
+Calculate fold changes (c vs b)
+
+```{r}
+fc_vals <- sapply(intersected_features, function(feat) {
+  mean(expr_cols[df_subset_clean$Next2 == "C", feat], na.rm = TRUE) -
+  mean(expr_cols[df_subset_clean$Next2 == "B", feat], na.rm = TRUE)
+})
+
+```
+
+visualising the results
+
+### volcano
+
+```{r}
+volcano_data <- lrt_subset_df %>%
+  filter(Feature %in% names(fc_vals)) %>%
+  mutate(log2FC = fc_vals[Feature],
+         negLog10P = -log10(LRT_pvalue))
+
+ggplot(volcano_data, aes(x = log2FC, y = negLog10P)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  labs(title = "Volcano Plot: Strain A (Next2: B vs C)",
+       x = "Log2 Fold Change (C vs B)",
+       y = "-Log10 p-value") +
+  theme_minimal()
+
+```
+
+### Volcano plot with EnhancedVolcano
+
+```{r}
+if (!requireNamespace("EnhancedVolcano", quietly = TRUE)) {
+  install.packages("BiocManager")
+  BiocManager::install("EnhancedVolcano")
+}
+
+colnames(lrt_subset_df)
+str(lrt_subset_df)
+library(EnhancedVolcano)
+
+# Step 1: Ensure Feature names are in both datasets
+stopifnot(all(lrt_subset_df$Feature %in% names(fc_vals)))
+
+# Step 2: Add fold change and transformed p-values directly
+lrt_subset_df$log2FC <- fc_vals[lrt_subset_df$Feature]
+lrt_subset_df$negLog10P <- -log10(lrt_subset_df$LRT_pvalue)
+
+# Make a copy
+volcano_data <- lrt_subset_df
+
+# Rename column manually
+colnames(volcano_data)[colnames(volcano_data) == "LRT_pvalue"] <- "pvalue"
+
+# Filter out NA p-values
+volcano_data <- volcano_data[!is.na(volcano_data$pvalue), ]
+
+
+str(volcano_data)
+head(volcano_data$pvalue)
+
+
+# Create volcano plot with EnhancedVolcano
+EnhancedVolcano(volcano_data,
+                lab = volcano_data$Feature,
+                x = 'log2FC',
+                y = 'pvalue',
+                title = 'Strain A (Next2 C vs B)',
+                subtitle = 'Volcano plot using EnhancedVolcano',
+                xlab = 'Log2 Fold Change (C vs B)',
+                ylab = '-Log10 P-value',
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                pointSize = 2.5,
+                labSize = 3.5,
+                colAlpha = 0.7,
+                col = c('grey30', 'forestgreen', 'royalblue', 'red2'))
+
+```
+
+PCA
+
+Select the top 100 most variable features
+
+```{r}
+library(FactoMineR)
+library(factoextra)
+# Top 100 most variable features
+top_var_feats <- names(sort(apply(expr_cols, 2, var), decreasing = TRUE))[1:100]
+
+```
+
+Preparing PCA matrix and running PCA
+
+```{r}
+# Matrix for PCA (samples = rows)
+pca_matrix <- as.matrix(expr_cols[, top_var_feats])
+rownames(pca_matrix) <- rownames(df_subset_clean)
+
+# Run PCA
+pca_res <- PCA(pca_matrix, graph = FALSE)
+
+```
+
+Extract explained variance for PC1 and PC2 and prepare groupd labels
+
+```{r}
+# Extract explained variance for PC1 and PC2
+explained_var_top <- round(pca_res$eig[1:2, 2], 1)
+
+# Define group labels
+group_labels <- factor(df_subset_clean$Next2)
+names(group_labels) <- rownames(df_subset_clean)
+
+```
+
+Generate and Customize PCA Plot
+
+-   Color samples by group (`Next2`) and add 95% confidence ellipses.
+
+-   Customize axis labels with the variance explained by PC1 and PC2.
+
+```{r}
+# Generate PCA plot object
+pca_plot_top <- fviz_pca_ind(pca_res,
+                              label = "none",
+                              habillage = group_labels,
+                              addEllipses = TRUE,
+                              ellipse.type = "confidence",
+                              palette = c("#00AFBB", "#E7B800"),
+                              title = "PCA (Top 100 Features): Strain A (Next2 B vs C)")
+
+# Add custom axis labels with variance percentages
+pca_plot_top +
+  xlab(paste0("PC1 (", explained_var_top[1], "%)")) +
+  ylab(paste0("PC2 (", explained_var_top[2], "%)"))
+
+```
+
+Using all features
+
+```{r}
+# Create matrix with all features (samples = rows, features = columns)
+pca_matrix_all <- as.matrix(expr_cols)
+rownames(pca_matrix_all) <- rownames(df_subset_clean)
+
+# Run PCA
+pca_res_all <- PCA(pca_matrix_all, graph = FALSE)
+
+# Define group labels (e.g., treatment groups)
+group_labels_all <- factor(df_subset_clean$Next2)
+names(group_labels_all) <- rownames(df_subset_clean)
+
+# Extract variance explained from PCA result
+explained_var <- round(pca_res_all$eig[1:2, 2], 1)  # % variance for PC1 and PC2
+
+# Generate base PCA plot
+pca_plot_all <- fviz_pca_ind(pca_res_all,
+                              label = "none",
+                              habillage = group_labels_all,
+                              addEllipses = TRUE,
+                              ellipse.type = "confidence",
+                              palette = c("#00AFBB", "#E7B800"),
+                              title = "PCA (All Features): Strain A (Next2 B vs C)")
+
+# Customize axis labels using ggplot2
+pca_plot_all +
+  xlab(paste0("PC1 (", explained_var[1], "%)")) +
+  ylab(paste0("PC2 (", explained_var[2], "%)"))
+
+
+```
+
+Heatmap
+
+Top 25
+
+```{r}
+library(pheatmap)
+# ----- Heatmap ----- -------------------------------
+# Select the top 25 features based on LRT significance (lowest LRT_pvalue)
+# Make a base R version of the subset
+top_features_df <- lrt_subset_df[!is.na(lrt_subset_df$LRT_pvalue), ]
+
+# Order by p-value
+top_features_df <- top_features_df[order(top_features_df$LRT_pvalue), ]
+
+# Take the top 25 Feature values
+top_features <- top_features_df$Feature[1:25]
+
+
+# Extract heatmap data for these features
+heat_data <- expr_cols[, top_features]
+
+# Create an annotation data frame for the samples using metadata
+annotation_df <- data.frame(
+  Next2 = df_subset_clean$Next2,
+  day = df_subset_clean$day
+)
+rownames(annotation_df) <- rownames(df_subset_clean)
+
+
+# Define custom colors for 'Next2' and 'Day'
+custom_colors <- list(
+  Next2 = c(B = "red", C = "blue"),  # B = red, C = blue
+  Day = c(
+    "2" = "lightgrey",  # grey
+    "3" = "darkgrey",  # dark grey
+    "4" = "black",  # almost black
+    "5" = "#654321",  # sienna (brown)
+    "6" = "sienna"   # dark brown
+  )
+)
+
+
+#library(pheatmap)
+
+# Extract top features (already defined earlier)
+heatmap_matrix <- t(expr_cols[, top_var_feats])  # Transpose to make features = rows
+
+# Optional: scale features across samples (z-score)
+heatmap_scaled <- t(scale(t(heatmap_matrix)))  # Scale by row (feature)
+
+# Build updated column annotations
+annotation_col <- data.frame(
+  Next2 = df_subset_clean$Next2,
+  Day = df_subset_clean$day,
+  row.names = rownames(df_subset_clean)
+)
+
+# Plot heatmap with both annotations
+pheatmap(heatmap_scaled,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_col = annotation_col,
+         annotation_colors = custom_colors,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         main = "Heatmap of Top Variable Features (Strain A, Next2 B vs C)")
+```
+
+All significant features heatmap
+
+```{r}
+# Select all features with adj p < 0.05
+signif_features <- lrt_subset_df %>%
+  filter(!is.na(adj_pval), adj_pval < 0.05) %>%
+  pull(Feature)
+
+# Extract and scale data
+heatmap_matrix <- t(expr_cols[, signif_features])
+heatmap_scaled <- t(scale(t(heatmap_matrix)))
+
+# Reuse annotation_col from before
+pheatmap(heatmap_scaled,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_col = annotation_col,
+         annotation_colors = custom_colors,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         main = "Heatmap of LRT-Significant Features (adj p < 0.05)")
+
+```
+
+All features
+
+```{r}
+# 1. Extract the full expression matrix (samples x features)
+heatmap_matrix_all <- t(expr_cols)  # transpose: features as rows
+
+# 2. Optional: scale each feature across samples (z-score)
+heatmap_scaled_all <- t(scale(t(heatmap_matrix_all)))  # scale by row
+
+# 3. Prepare annotations for samples (columns of the heatmap)
+annotation_col <- data.frame(
+  Next2 = df_subset_clean$Next2,
+  Day = df_subset_clean$day,
+  row.names = rownames(df_subset_clean)
+)
+
+# 4. Plot the full heatmap
+pheatmap(heatmap_scaled_all,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_col = annotation_col,
+         annotation_colors = custom_colors,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         fontsize_col = 8,
+         main = "Heatmap of All Features (Strain A, Next2 B vs C)")
+
+```
+
+# IPA input for strain A next2 C vs B
+
+Subset samples
+
+```{r}
+# Step 1: Subset to strain A, Next2 B or C
+ipa_idx <- which(colData(se_glog)$strain == "A" & colData(se_glog)$Next2 %in% c("B", "C"))
+se_ipa <- se_glog[, ipa_idx]
+
+```
+
+Extract expression data and metadata
+
+```{r}
+# Step 2: Extract expression matrix and sample info
+expr <- assay(se_ipa)  # rows = features, cols = samples
+metadata <- as.data.frame(colData(se_ipa))
+
+```
+
+Extract feature info
+
+-   Feature-level metadata including `mzs` (mass-to-charge ratio) and `RTs` (retention time).
+
+```{r}
+# Step 3: Extract feature info — must contain mz and RT
+feature_info <- as.data.frame(rowData(se_ipa))
+
+# Safety check: must have mz and RT columns
+if (!all(c("mzs", "RTs") %in% colnames(feature_info))) {
+  stop("Feature metadata must include 'mz' and 'rt' columns.")
+}
+
+```
+
+Building IPA export table
+
+```{r}
+# Step 4: Build the dataframe in ipaPy2 format
+ipa_export <- data.frame(
+  ids = as.numeric(rownames(expr)),  # or create sequential if rownames are not numeric
+  mzs = feature_info$mzs,
+  RTs = feature_info$RTs,
+  expr,  # sample intensities
+  check.names = FALSE
+)
+```
+
+Standardising sample names and exporting to csv
+
+```{r}
+# Step 5: Reset column names for samples (e.g., sample1, sample2, ...)
+sample_names <- paste0("sample", seq_len(ncol(expr)))
+colnames(ipa_export)[4:ncol(ipa_export)] <- sample_names
+
+# Step 6: Write to CSV
+write.csv(ipa_export, "ipa_input_clusterFormat_strainA_C_vs_B.csv", row.names = FALSE)
+
+```
+
+# Rebuild the input for IPA (all metabolites, not just DE)
+
+```{r}
+# ✅ Final IPA Input Builder (Non-Clustered Format)
+
+# Step 1: Subset relevant samples (Strain A, Next2 B and C)
+ipa_idx_full <- which(colData(se_glog)$strain == "A" & colData(se_glog)$Next2 %in% c("B", "C"))
+se_ipa_full <- se_glog[, ipa_idx_full]
+
+# Step 2: Extract data
+expr_all <- assay(se_ipa_full)
+feature_info <- as.data.frame(rowData(se_ipa_full))
+
+# Step 3: Ensure RTs are in seconds (if in minutes, convert)
+if (mean(feature_info$RTs, na.rm = TRUE) < 100) {
+  feature_info$RTs <- feature_info$RTs * 60
+}
+
+# Step 4: Create ipaPy2-ready dataframe
+ipa_input <- data.frame(
+  ids = rownames(expr_all),
+  mzs = feature_info$mzs,
+  RTs = feature_info$RTs,
+  expr_all,
+  check.names = FALSE
+)
+
+# Step 5: Rename intensity columns to sample1, sample2, ...
+colnames(ipa_input)[4:ncol(ipa_input)] <- paste0("sample", seq_len(ncol(expr_all)))
+
+# Step 6: Save for Python
+write.csv(ipa_input, "ipa_input_allFeatures_pos_C_vs_B.csv", row.names = FALSE)
+
+```

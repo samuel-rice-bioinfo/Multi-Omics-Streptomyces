@@ -1,0 +1,806 @@
+---
+title: "metab"
+format: html
+editor: visual
+---
+
+## negative mode
+
+Load core packages and metabolomics dataset for positive ion mode.
+
+Clean sample info and align metadata with the intensity matrix.
+
+Build Summarized Experiment object for structured downstream analysis.
+
+loading and inspecting data
+
+```{r}
+# Load required packages
+library(pmp)
+library(SummarizedExperiment)
+library(dplyr)
+library(ggplot2)
+
+# Load data
+load("metabolomics_neg.RData")
+
+# Re-assign to new variable names to avoid overwrite issues
+features_info_neg <- features_info
+samples_info_neg <- samples_info
+colnames(features_info_neg)
+colnames(samples_info_neg)
+colnames(data_neg)
+
+```
+
+data inspection
+
+```{r}
+# Show column names of data matrix
+colnames(data_neg)
+
+# Show IDs in sample info
+samples_info_neg$id
+
+# Find the unmatched columns — these are likely QC samples to remove
+unmatched_neg <- setdiff(colnames(data_neg), samples_info_neg$id)
+
+# View them
+print(unmatched_neg)
+
+```
+
+Ensure sample feature alignment and create summarised experiment object
+
+```{r}
+
+
+# Clean: ensure sample and feature names are aligned
+rownames(features_info_neg) <- rownames(data_neg)
+rownames(samples_info_neg) <- colnames(data_neg)
+
+
+# Build SummarizedExperiment object
+se_neg_raw <- SummarizedExperiment(
+  assays = list(counts = as.matrix(data_neg)),
+  rowData = features_info_neg,
+  colData = samples_info_neg
+)
+
+
+
+
+```
+
+### Perform multi-step feature filtering:
+
+Removing samples with too many missing values.
+
+Keeping features detected in 90% of QC samples and all samples.
+
+Removing unstable features with high RSD in QCs.
+
+```{r}
+# Step 1: Retain features detected in ≥90% of QC samples
+se_neg_qc <- filter_peaks_by_fraction(
+  df = se_neg_raw,
+  min_frac = 0.9,
+  classes = se_neg_raw$strain,
+  method = "QC",
+  qc_label = "QCs"
+)
+
+# Step 2: Remove features with RSD > 30% in QCs
+se_neg_rsd <- filter_peaks_by_rsd(
+  df = se_neg_qc,
+  max_rsd = 30,
+  classes = se_neg_qc$strain,
+  qc_label = "QCs"
+)
+
+```
+
+PQN normalisation using QC samples as reference
+
+Imputing missing values with KNN
+
+Apply GLOG transformation to stabilize variance across intensities.
+
+```{r}
+# Apply PQN normalisation
+se_neg_pqn <- pqn_normalisation(
+  df = se_neg_rsd,
+  classes = se_neg_rsd$strain,
+  qc_label = "QCs"
+)
+
+
+
+```
+
+Stats for poster
+
+```{r}
+# Calculate for metabolomics positive mode before imputation
+library(SummarizedExperiment)
+
+# Subset metadata
+meta_neg <- colData(se_neg_pqn)
+
+# Indices for B and C conditions
+idx_B_neg <- which(meta_neg$strain == "A" & meta_neg$Next2 == "B")
+idx_C_neg <- which(meta_neg$strain == "A" & meta_neg$Next2 == "C")
+
+# Expression matrices
+mat_B_neg <- assay(se_neg_pqn)[, idx_B_neg]
+mat_C_neg <- assay(se_neg_pqn)[, idx_C_neg]
+
+# Calculate stats
+n_feat_B_neg <- nrow(mat_B_neg)
+n_feat_C_neg <- nrow(mat_C_neg)
+
+prop_miss_B_neg <- round(100 * sum(is.na(mat_B_neg)) / (n_feat_B_neg * ncol(mat_B_neg)), 2)
+prop_miss_C_neg <- round(100 * sum(is.na(mat_C_neg)) / (n_feat_C_neg * ncol(mat_C_neg)), 2)
+
+# Output for poster summary table
+cat("Negative Mode - Strain A, Next2 B:\n",
+    "  Features:", n_feat_B_neg, "\n",
+    "  Missing %:", prop_miss_B_neg, "%\n\n")
+
+cat("Negative Mode - Strain A, Next2 C:\n",
+    "  Features:", n_feat_C_neg, "\n",
+    "  Missing %:", prop_miss_C_neg, "%\n")
+
+```
+
+Imputation
+
+```{r}
+# KNN Imputation
+se_neg_imputed <- mv_imputation(
+  df = se_neg_pqn,
+  method = "knn"
+)
+
+# Save this version in case you want to compare it with GLOG later
+se_neg_pre_glog <- se_neg_imputed
+
+
+```
+
+Glog
+
+```{r}
+# GLOG Transformation
+se_neg_glog <- glog_transformation(
+  df = se_neg_imputed,
+  classes = se_neg_imputed$strain,
+  qc_label = "QCs"
+)
+
+```
+
+#### Visualising the transformations
+
+Visualize optimal lambda for GLOG and histograms of intensity distributions before and after transformation.
+
+Shows how the Sum of Squared Errors (SSE) changes with different lambda values used in the GLOG transformation, helping to identify the most variance-stabilizing parameter
+
+```{r}
+
+# Visualize lambda optimization
+opt_lambda <- processing_history(se_glog)$glog_transformation$lambda_opt
+glog_plot_optimised_lambda(
+  df = se_glog,
+  optimised_lambda = opt_lambda,
+  classes = se_pre_glog$strain,
+  qc_label = "QCs"
+)
+
+# Histograms: Before vs After GLOG
+par(mfrow = c(1, 2))
+hist(assay(se_pre_glog),
+     breaks = 100, main = "Before GLOG", xlab = "Intensity", col = "tomato")
+hist(assay(se_glog),
+     breaks = 100, main = "After GLOG", xlab = "Transformed Intensity", col = "steelblue")
+
+```
+
+Transformation structure checks for further analysis
+
+```{r}
+colnames(se_glog)
+rownames(se_glog)
+colnames(samples_info_pos)
+```
+
+### PCA
+
+Run PCA on normalised data to explore clustering, using metadata for visual grouping
+
+```{r}
+# Ensure necessary libraries are installed and loaded
+if (!requireNamespace("pmp", quietly = TRUE)) install.packages("pmp")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("ggfortify", quietly = TRUE)) install.packages("ggfortify")
+
+library(ggplot2)
+library(ggfortify)
+
+# Extract matrix
+data_matrix_neg <- assay(se_neg_glog)
+
+# Run PCA
+pca_neg <- prcomp(t(data_matrix_neg), center = TRUE, scale. = TRUE)
+
+# Metadata
+pca_meta_neg <- data.frame(
+  PC1 = pca_neg$x[, 1],
+  PC2 = pca_neg$x[, 2],
+  Strain = se_neg_glog$strain,
+  Next2 = se_neg_glog$Next2,
+  Day = se_neg_glog$day
+)
+
+# Plot
+ggplot(pca_meta_neg, aes(x = PC1, y = PC2, color = Strain, shape = Next2)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA of Metabolomics Data (Negative Mode)",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal()
+
+```
+
+PCA for subset conditions
+
+```{r}
+# Load required libraries
+library(FactoMineR)
+library(factoextra)
+library(ggplot2)
+
+# Subset samples: Strain A with Next2 = B or C
+idx_subset <- which(se_neg_glog$strain == "A" & se_neg_glog$Next2 %in% c("B", "C"))
+se_neg_subset <- se_neg_glog[, idx_subset]
+
+# Prepare data and metadata
+expr_neg_sub <- t(assay(se_neg_subset))                       # Transpose: samples = rows
+meta_neg_sub <- as.data.frame(colData(se_neg_subset))        # Sample metadata
+
+# Run PCA
+pca_res <- PCA(expr_neg_sub, graph = FALSE)
+explained_var <- round(pca_res$eig[1:2, 2], 1)                # PC1 and PC2 variance %
+
+# Format PCA coordinates with metadata
+pca_coords <- data.frame(pca_res$ind$coord)
+pca_coords$Next2 <- meta_neg_sub$Next2
+pca_coords$Day <- meta_neg_sub$day
+
+# Plot PCA
+ggplot(pca_coords, aes(x = Dim.1, y = Dim.2, color = Next2, shape = Day)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA - Strain A (Next2 B vs C, Negative Mode)",
+    x = paste0("PC1 (", explained_var[1], "%)"),
+    y = paste0("PC2 (", explained_var[2], "%)")
+  ) +
+  theme_minimal()
+
+```
+
+### Likelihood ratio test (LRT)
+
+Prepare data for LRT: Extract metadata and expression data, ensure variables are factors.
+
+Run LRT per feature comparing full vs reduced models.
+
+Adjust p-values (FDR) and identify top features.
+
+```{r}
+# Install necessary packages (if not already installed)
+if (!requireNamespace("lmtest", quietly = TRUE)) install.packages("lmtest")
+
+# Load libraries
+library(lmtest)
+library(SummarizedExperiment)
+library(dplyr)
+
+```
+
+# Likelihood Ratio Testing
+
+preparing data and running forlooped LRT
+
+Question: Does adding Next2 to the model explain significantly more variation in intensity than day alone?
+
+-   Nested model: `intensity ~ day`
+-   Complex model: `intensity ~ Next2 + day`
+
+```{r}
+# Extract relevant samples: strain A with Next2 in B or C
+idx <- which(colData(se_glog)$strain == "A" & colData(se_glog)$Next2 %in% c("B", "C"))
+se_subset_neg <- se_glog[, idx]
+ 
+lrt_results <- data.frame(
+  metabolite = rownames(se_subset_neg),
+  p_value = NA_real_, 
+  chisq = NA_real_,
+  df = NA_integer_,
+  logLik_nested = NA_real_,
+  logLik_complex = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_len(nrow(se_subset_neg))) {
+  metab_id <- rownames(se_subset_neg)[i]
+  intensity <- assay(se_subset_neg)[i, ]
+  
+  model_df <- data.frame(
+    intensity = intensity,
+    day = colData(se_subset_neg)$day,
+    Next2 = colData(se_subset_neg)$Next2
+  )
+  
+  tryCatch({
+    nested <- glm(intensity ~ day, data = model_df)
+    complex <- glm(intensity ~ Next2 + day, data = model_df)
+    
+    lrt <- lrtest(nested, complex)
+    
+    lrt_results$p_value[i] <- lrt$`Pr(>Chisq)`[2]
+    lrt_results$chisq[i] <- lrt$Chisq[2]
+    lrt_results$df[i] <- lrt$Df[2]
+    lrt_results$logLik_nested[i] <- as.numeric(logLik(nested))
+    lrt_results$logLik_complex[i] <- as.numeric(logLik(complex))
+    
+  }, error = function(e) {
+    lrt_results$p_value[i] <- NA
+  })
+}
+
+# Adjust p-values
+lrt_results$adj_p_value <- p.adjust(lrt_results$p_value, method = "fdr")
+
+```
+
+Tabular model statistics
+
+```{r}
+# Round and arrange
+lrt_table <- lrt_results %>%
+  mutate(across(c(p_value, adj_p_value, chisq, logLik_nested, logLik_complex), round, digits = 8)) %>%
+  arrange(adj_p_value)
+
+# View top 10 as a summary table
+print(head(lrt_table, 10))
+
+```
+
+#### Visualising output
+
+Chisquared values vs pvalues
+
+-   **X-axis**: The LRT Chi-squared statistic.
+
+-   **Y-axis**: −log10(p-value) from the same test.
+
+    This visualizes the **strength of the test**:
+
+-   Higher Chi-squared = stronger statistical evidence against the null model.
+
+-   Higher −log10(p-value) = higher statistical significance.
+
+-   It gives a **sanity check**: strong chi-sq should correspond to low p-values (upper right corner).
+
+```{r}
+ggplot(lrt_results, aes(x = chisq, y = -log10(p_value))) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "LRT Statistics per Metabolite",
+       x = "Chi-squared Statistic",
+       y = "-log10(p-value)")
+
+```
+
+### Preparing results for post analysis
+
+```{r}
+colnames(lrt_results)
+# Fully convert to base data.frame
+lrt_neg_df <- as.data.frame(lrt_results) %>%
+  dplyr::rename(
+    Feature = metabolite,
+    LRT_pvalue = p_value,
+    adj_pval = adj_p_value
+  )
+
+
+# Get expression matrix from se_subset_neg
+expr_cols_neg <- t(assay(se_subset_neg))  # transpose: samples as rows
+colnames(expr_cols_neg) <- rownames(se_subset_neg)  # makes features = column names
+# Metadata for those samples
+df_neg_subset_clean <- as.data.frame(colData(se_subset_neg))
+
+
+
+```
+
+```{r}
+# Check overlap
+intersected_features <- intersect(lrt_neg_df$Feature, colnames(expr_cols_neg))
+
+# Sanity check
+length(intersected_features)  # should be > 0
+
+# Now safely calculate fold changes
+fc_vals_neg <- sapply(intersected_features, function(feat) {
+  mean(expr_cols_neg[df_neg_subset_clean$Next2 == "C", feat]) - 
+  mean(expr_cols_neg[df_neg_subset_clean$Next2 == "B", feat])
+})
+
+```
+
+```{r}
+head(lrt_neg_df$Feature)
+head(rownames(se_subset_neg))
+head(colnames(expr_cols_neg))  # These should match lrt_neg_df$Feature!
+
+expr_cols_neg <- t(assay(se_subset_neg))  # samples = rows, features = columns
+colnames(expr_cols_neg) <- rownames(se_subset_neg)  # features = original metabolite names
+intersected_features <- intersect(lrt_neg_df$Feature, colnames(expr_cols_neg))
+length(intersected_features)
+
+```
+
+```{r}
+expr_cols_neg <- as.data.frame(t(assay(se_subset_neg)))  # transpose + coerce to data frame
+colnames(expr_cols_neg) <- rownames(se_subset_neg)       # features = column names
+
+df_neg_subset_clean <- as.data.frame(colData(se_subset_neg))  # sample metadata
+fc_vals_neg <- sapply(intersected_features, function(feat) {
+  mean(expr_cols_neg[df_neg_subset_clean$Next2 == "C", feat], na.rm = TRUE) -
+  mean(expr_cols_neg[df_neg_subset_clean$Next2 == "B", feat], na.rm = TRUE)
+})
+
+```
+
+visualising the results
+
+### volcano
+
+```{r}
+volcano_neg_data <- lrt_neg_df %>%
+  filter(Feature %in% names(fc_vals_neg)) %>%
+  mutate(log2FC = fc_vals_neg[Feature],
+         negLog10P = -log10(LRT_pvalue))
+
+ggplot(volcano_neg_data, aes(x = log2FC, y = negLog10P)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  labs(title = "Volcano Plot: Strain A (Next2: B vs C)",
+       x = "Log2 Fold Change (C vs B)",
+       y = "-Log10 p-value") +
+  theme_minimal()
+
+```
+
+### Volcano plot with EnhancedVolcano
+
+```{r}
+if (!requireNamespace("EnhancedVolcano", quietly = TRUE)) {
+  install.packages("BiocManager")
+  BiocManager::install("EnhancedVolcano")
+}
+
+colnames(lrt_neg_df)
+str(lrt_neg_df)
+library(EnhancedVolcano)
+
+# Step 1: Ensure Feature names are in both datasets
+stopifnot(all(lrt_neg_df$Feature %in% names(fc_vals_neg)))
+
+# Step 2: Add fold change and transformed p-values directly
+lrt_neg_df$log2FC <- fc_vals_neg[lrt_neg_df$Feature]
+lrt_neg_df$negLog10P <- -log10(lrt_neg_df$LRT_pvalue)
+
+# Make a copy
+volcano_neg_data <- lrt_neg_df
+
+# Rename column manually
+colnames(volcano_neg_data)[colnames(volcano_neg_data) == "LRT_pvalue"] <- "pvalue"
+
+# Filter out NA p-values
+volcano_neg_data <- volcano_neg_data[!is.na(volcano_neg_data$pvalue), ]
+
+
+str(volcano_neg_data)
+head(volcano_neg_data$pvalue)
+
+
+# Create volcano plot with EnhancedVolcano
+EnhancedVolcano(volcano_neg_data,
+                lab = volcano_neg_data$Feature,
+                x = 'log2FC',
+                y = 'pvalue',
+                title = 'Strain A (Next2 C vs B)',
+                subtitle = 'Volcano plot using EnhancedVolcano',
+                xlab = 'Log2 Fold Change (C vs B)',
+                ylab = '-Log10 P-value',
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                pointSize = 2.5,
+                labSize = 3.5,
+                colAlpha = 0.7,
+                col = c('grey30', 'forestgreen', 'royalblue', 'red2'))
+
+```
+
+PCA
+
+Using the top 100 most variable features
+
+```{r}
+library(FactoMineR)
+library(factoextra)
+# Top 100 most variable features
+top_var_feats <- names(sort(apply(expr_cols_neg, 2, var), decreasing = TRUE))[1:100]
+
+# Matrix for PCA (samples = rows)
+pca_matrix <- as.matrix(expr_cols_neg[, top_var_feats])
+rownames(pca_matrix) <- rownames(df_neg_subset_clean)
+
+# Run PCA
+pca_res <- PCA(pca_matrix, graph = FALSE)
+
+# Extract explained variance for PC1 and PC2
+explained_var_top <- round(pca_res$eig[1:2, 2], 1)
+
+# Define group labels
+group_labels <- factor(df_neg_subset_clean$Next2)
+names(group_labels) <- rownames(df_neg_subset_clean)
+
+# Generate PCA plot object
+pca_plot_top <- fviz_pca_ind(pca_res,
+                              label = "none",
+                              habillage = group_labels,
+                              addEllipses = TRUE,
+                              ellipse.type = "confidence",
+                              palette = c("#00AFBB", "#E7B800"),
+                              title = "PCA (Top 100 Features): Strain A (Next2 B vs C)")
+
+# Add custom axis labels with variance percentages
+pca_plot_top +
+  xlab(paste0("PC1 (", explained_var_top[1], "%)")) +
+  ylab(paste0("PC2 (", explained_var_top[2], "%)"))
+
+```
+
+Using all features
+
+```{r}
+# Create matrix with all features (samples = rows, features = columns)
+pca_matrix_all <- as.matrix(expr_cols_neg)
+rownames(pca_matrix_all) <- rownames(df_neg_subset_clean)
+
+# Run PCA
+pca_res_all <- PCA(pca_matrix_all, graph = FALSE)
+
+# Define group labels (e.g., treatment groups)
+group_labels_all <- factor(df_neg_subset_clean$Next2)
+names(group_labels_all) <- rownames(df_neg_subset_clean)
+
+# Extract variance explained from PCA result
+explained_var <- round(pca_res_all$eig[1:2, 2], 1)  # % variance for PC1 and PC2
+
+# Generate base PCA plot
+pca_plot_all <- fviz_pca_ind(pca_res_all,
+                              label = "none",
+                              habillage = group_labels_all,
+                              addEllipses = TRUE,
+                              ellipse.type = "confidence",
+                              palette = c("#00AFBB", "#E7B800"),
+                              title = "PCA (All Features): Strain A (Next2 B vs C)")
+
+# Customize axis labels using ggplot2
+pca_plot_all +
+  xlab(paste0("PC1 (", explained_var[1], "%)")) +
+  ylab(paste0("PC2 (", explained_var[2], "%)"))
+
+
+```
+
+Heatmap
+
+Top 25
+
+```{r}
+library(pheatmap)
+# ----- Heatmap ----- -------------------------------
+# Select the top 25 features based on LRT significance (lowest LRT_pvalue)
+# Make a base R version of the subset
+top_features_neg_df <- lrt_neg_df[!is.na(lrt_neg_df$LRT_pvalue), ]
+
+# Order by p-value
+top_features_neg_df <- top_features_neg_df[order(top_features_neg_df$LRT_pvalue), ]
+
+# Take the top 25 Feature values
+top_features <- top_features_neg_df$Feature[1:25]
+
+
+# Extract heatmap data for these features
+heat_data <- expr_cols_neg[, top_features]
+
+# Create an annotation data frame for the samples using metadata
+annotation_df_neg <- data.frame(
+  Next2 = df_neg_subset_clean$Next2,
+  day = df_neg_subset_clean$day
+)
+rownames(annotation_df_neg) <- rownames(df_neg_subset_clean)
+
+
+# Define custom colors for 'Next2' and 'Day'
+custom_colors <- list(
+  Next2 = c(B = "#00AFBB", C = "#E7B800"),
+  Day = c(
+    "2" = "green",  # lime green
+    "3" = "red",  #red 
+    "4" = "orange",  # purple
+    "5" = "pink",  # pink
+    "6" = "blue"   # blue
+    # Add more if needed
+  )
+)
+
+#library(pheatmap)
+
+# Extract top features (already defined earlier)
+heatmap_matrix <- t(expr_cols_neg[, top_var_feats])  # Transpose to make features = rows
+
+# Optional: scale features across samples (z-score)
+heatmap_scaled_neg <- t(scale(t(heatmap_matrix)))  # Scale by row (feature)
+
+# Build updated column annotations
+annotation_col_neg <- data.frame(
+  Next2 = df_neg_subset_clean$Next2,
+  Day = df_neg_subset_clean$day,
+  row.names = rownames(df_neg_subset_clean)
+)
+
+# Plot heatmap with both annotations
+pheatmap(heatmap_scaled_neg,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_col_neg = annotation_col_neg,
+         annotation_col_negors = custom_colors,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         main = "Heatmap of Top Variable Features (Strain A, Next2 B vs C)")
+```
+
+All significant features heatmap
+
+```{r}
+# Select all features with adj p < 0.05
+signif_features <- lrt_neg_df %>%
+  filter(!is.na(adj_pval), adj_pval < 0.05) %>%
+  pull(Feature)
+
+# Extract and scale data
+heatmap_matrix <- t(expr_cols_neg[, signif_features])
+heatmap_scaled_neg <- t(scale(t(heatmap_matrix)))
+
+# Reuse annotation_col_neg from before
+pheatmap(heatmap_scaled_neg,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_col_neg = annotation_col_neg,
+         annotation_col_negors = custom_colors,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         main = "Heatmap of LRT-Significant Features (adj p < 0.05)")
+
+```
+
+All features
+
+```{r}
+# 1. Extract the full expression matrix (samples x features)
+heatmap_matrix_all <- t(expr_cols_neg)  # transpose: features as rows
+
+# 2. Optional: scale each feature across samples (z-score)
+heatmap_scaled_neg_all <- t(scale(t(heatmap_matrix_all)))  # scale by row
+
+# 3. Prepare annotations for samples (columns of the heatmap)
+annotation_col_neg <- data.frame(
+  Next2 = df_neg_subset_clean$Next2,
+  Day = df_neg_subset_clean$day,
+  row.names = rownames(df_neg_subset_clean)
+)
+
+# 4. Plot the full heatmap
+pheatmap(heatmap_scaled_neg_all,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_col_neg = annotation_col_neg,
+         annotation_col_negors = custom_colors,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         fontsize_col = 8,
+         main = "Heatmap of All Features (Strain A, Next2 B vs C)")
+
+```
+
+IPA input just for strain A next2 C vs B
+
+```{r}
+# Step 1: Subset to strain A, Next2 B or C
+ipa_idx <- which(colData(se_glog)$strain == "A" & colData(se_glog)$Next2 %in% c("B", "C"))
+se_ipa <- se_glog[, ipa_idx]
+
+# Step 2: Extract expression matrix and sample info
+expr <- assay(se_ipa)  # rows = features, cols = samples
+metadata <- as.data.frame(colData(se_ipa))
+
+# Step 3: Extract feature info — must contain mz and RT
+feature_info <- as.data.frame(rowData(se_ipa))
+
+# Safety check: must have mz and RT columns
+if (!all(c("mzs", "RTs") %in% colnames(feature_info))) {
+  stop("Feature metadata must include 'mz' and 'rt' columns.")
+}
+
+# Step 4: Build the dataframe in ipaPy2 format
+ipa_export <- data.frame(
+  ids = as.numeric(rownames(expr)),  # or create sequential if rownames are not numeric
+  mzs = feature_info$mzs,
+  RTs = feature_info$RTs,
+  expr,  # sample intensities
+  check.names = FALSE
+)
+
+# Step 5: Reset column names for samples (e.g., sample1, sample2, ...)
+sample_names <- paste0("sample", seq_len(ncol(expr)))
+colnames(ipa_export)[4:ncol(ipa_export)] <- sample_names
+
+# Step 6: Write to CSV
+write.csv(ipa_export, "ipa_input_clusterFormat_strainA_C_vs_B.csv", row.names = FALSE)
+
+```
+
+# PathIntegrate Input
+
+Negative Mode ipaPy2 Export Block
+
+```{r}
+# Subset to strain A, Next2 = B or C for IPA input
+ipa_idx_neg <- which(colData(se_neg_glog)$strain == "A" & colData(se_neg_glog)$Next2 %in% c("B", "C"))
+se_neg_ipa <- se_neg_glog[, ipa_idx_neg]
+
+# Extract expression matrix and feature metadata
+expr_neg_all <- assay(se_neg_ipa)
+feature_info_neg <- as.data.frame(rowData(se_neg_ipa))
+
+# Convert RTs to seconds if needed
+if (mean(feature_info_neg$RTs, na.rm = TRUE) < 100) {
+  feature_info_neg$RTs <- feature_info_neg$RTs * 60
+}
+
+# Build ipaPy2-compatible DataFrame
+ipa_input_neg <- data.frame(
+  ids = rownames(expr_neg_all),
+  mzs = feature_info_neg$mzs,
+  RTs = feature_info_neg$RTs,
+  expr_neg_all,
+  check.names = FALSE
+)
+
+# Rename intensity columns to sample1, sample2, ...
+colnames(ipa_input_neg)[4:ncol(ipa_input_neg)] <- paste0("sample", seq_len(ncol(expr_neg_all)))
+
+# Save the file for use in ipaPy2 (Python)
+write.csv(ipa_input_neg, "ipa_input_allFeatures_neg_C_vs_B.csv", row.names = FALSE)
+
+```
