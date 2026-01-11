@@ -1,0 +1,431 @@
+---
+title: "pathways final mapping"
+format: html
+editor: visual
+---
+
+## Creating the pathway database for multiomic integration
+
+Overview:
+
+Proteins: DIAMOND (UniProt) + EggNOG (KEGG KO & Pathways) → protein pathways
+
+Metabolites: KEGG compound IDs → KEGG pathways
+
+Combining protein & metabolite pathway matrices, de-duplicate, and unify
+
+makes sure its in the correct format (wide)
+
+```{r}
+# Loading  libraries
+library(tidyverse)
+library(janitor) # helps clean data
+library(pbapply) # progress bars
+library(KEGGREST) # KEGG pathway retrieval
+
+# Loading DIAMOND results
+diamond <- read_csv("diamond_results.csv") %>% 
+  clean_names() # cleaning
+
+
+# Loading the EggNOG annotations
+eggnog <- read_csv("eggnog_clean.csv") %>% 
+  clean_names() #cleaning
+
+# Extracting KO + pathway from EggNOG with one row per pathway splitting multiple pathway entries into individual rows
+prot_ko <- eggnog %>%
+  filter(!is.na(kegg_ko), !is.na(kegg_pathway)) %>%
+  select(query = number_query, kegg_ko, kegg_pathway) %>%
+  mutate(kegg_pathway = str_split(kegg_pathway, ",")) %>%
+  unnest(kegg_pathway)
+
+
+```
+
+```{r}
+colnames(eggnog)
+
+```
+
+Join UniProt IDs
+
+```{r}
+# Joining DIAMOND and EggNOG to get UniProt IDs + KEGG Pathways for multomics
+prot_mapped <- prot_ko %>%
+  left_join(diamond, by = "query") %>%
+  filter(!is.na(uniprot_id), !is.na(kegg_pathway)) %>%
+  select(query, kegg_ko, uniprot_id, kegg_pathway)
+
+```
+
+checking merge
+
+```{r}
+# Verifying the number of KO annotations successfully mapped to UniProt
+n_total_eggnog <- prot_ko %>% distinct(query) %>% nrow()
+n_with_uniprot <- prot_mapped %>% distinct(query) %>% nrow()
+
+cat("Total EggNOG queries:", n_total_eggnog, "\n")
+cat("Mapped to UniProt:", n_with_uniprot, "\n")
+
+
+```
+
+Getting pathway names
+
+```{r}
+unique_pathways <- unique(prot_mapped$kegg_pathway)
+unique_pathways <- unique_pathways[unique_pathways != "-"]
+
+# Fix the IDs before querying KEGG
+unique_pathways <- gsub("^ko", "map", unique_pathways)
+
+# Defining function to retrieve KEGG pathway names for use as eggnog mapper data only has ids
+# Progress tacked with pbsapply and stored for reuse
+get_pathway_name <- function(pid) {
+  tryCatch({
+    res <- keggGet(pid)
+    if (length(res) > 0 && !is.null(res[[1]]$NAME)) {
+      return(res[[1]]$NAME)
+    } else {
+      return(NA)
+    }
+  }, error = function(e) NA)
+}
+
+# Retrieving names with progress bar
+name_list <- pbsapply(unique_pathways, get_pathway_name)
+flat_names <- sapply(name_list, function(x) if (length(x) > 0) x[1] else NA)
+
+# Building tibble to store info
+pathway_names <- tibble(
+  kegg_pathway = unique_pathways,
+  pathway_name = flat_names
+)
+
+# Saving for reuse
+write_csv(pathway_names, "pathway_names.csv")
+
+```
+
+Creating protein pathway mapping
+
+```{r}
+# merging the pathway names with the uniprot data
+protein_pathway_map <- prot_mapped %>%
+  left_join(pathway_names, by = "kegg_pathway") %>%
+  filter(!is.na(uniprot_id), !is.na(pathway_name)) %>%
+  distinct(kegg_pathway, pathway_name, uniprot_id)
+
+```
+
+Diagnostic checking
+
+```{r}
+head(pathway_names)
+head(prot_mapped$kegg_pathway)
+intersect(pathway_names$kegg_pathway, prot_mapped$kegg_pathway)
+
+```
+
+Reshaping for pathintegrate
+
+```{r}
+# Grouping all the uniprot ids by pathway
+pathway_list <- protein_pathway_map %>%
+  filter(!is.na(pathway_name), kegg_pathway != "-") %>%  
+  group_by(kegg_pathway, pathway_name) %>%
+  summarise(features = list(unique(uniprot_id)), .groups = "drop")
+
+
+# Settingg up matrix in wide foormat so each row is a pathway and each column a feature
+max_proteins <- max(lengths(pathway_list$features))
+if (is.infinite(max_proteins)) stop("No UniProt IDs found for any pathway.")
+
+# Pad matrix with "None" if there is a gap to prevent downstream errors
+protein_matrix <- t(sapply(pathway_list$features, function(x) {
+  length(x) <- max_proteins
+  x[is.na(x)] <- "None"
+  x
+}))
+
+# Cleaning up pathway names to ensure reproducibility
+pathway_list$pathway_name <- lapply(pathway_list$pathway_name, function(x) {
+  if (is.null(x)) return(NA_character_)
+  return(x)
+})
+pathway_list$pathway_name <- unlist(pathway_list$pathway_name)
+
+# Final matrix for export for downstream use
+protein_matrix_df <- cbind(
+  pathway_id = pathway_list$kegg_pathway,
+  pathway_name = pathway_list$pathway_name,
+  as.data.frame(protein_matrix, stringsAsFactors = FALSE)
+)
+
+# Exportting
+write.csv(protein_matrix_df, "pathintegrate_protein_pathways.csv", row.names = FALSE)
+
+```
+
+```{r}
+# diagnostics
+nrow(diamond)
+
+# Should return many rows with non-NA KEGG pathways to check clarity
+eggnog %>%
+  filter(!is.na(kegg_pathway)) %>%
+  select(kegg_pathway) %>%
+  distinct() %>%
+  head(10)
+
+nrow(prot_ko)  
+
+```
+
+Logging unmapped proteins
+
+```{r}
+# Making sure we keep track of unmapped proteins to pathways
+mapped_ids <- unique(protein_pathway_map$uniprot_id)
+all_ids <- unique(prot_mapped$uniprot_id)
+
+unmapped_ids <- setdiff(all_ids, mapped_ids)
+write_lines(unmapped_ids, "uniprot_ids_not_in_pathways.txt")
+
+cat("Unmapped UniProt IDs saved:", length(unmapped_ids), "\n")
+
+```
+
+## Loading metabolite data and mapping kegg pathways
+
+```{r}
+# Reloading libraries
+library(tidyverse)
+library(pbapply)
+library(KEGGREST)
+df <- read.csv("pathintegrate_ready_metabolomics_day3_4.csv", row.names = 1)
+kegg_ids <- colnames(df)  # making a list of kegg ids from colnames
+
+```
+
+Run full mapping
+
+```{r}
+# using keggrest to map metabolite pathway ids to pathway names for biological interpretation
+getKEGGpaths <- function(metab) {
+  Sys.sleep(0.5)  # KEGG API throttle
+  tryCatch({
+    info <- keggGet(paste0("cpd:", metab))[[1]]
+    return(info$PATHWAY)
+  }, error = function(e) {
+    message("Failed:", metab)
+    return(NULL)
+  })
+}
+full_info <- pblapply(kegg_ids, getKEGGpaths)
+
+```
+
+Flattenning results and mapping table
+
+```{r}
+# Flattenning results tp create mapping table
+flat_kegg <- unlist(full_info, use.names = TRUE)
+
+full_df <- tibble(
+  kegg_id     = rep(kegg_ids, lengths(full_info)),
+  pathway_id  = names(flat_kegg),
+  pathway_name= as.vector(flat_kegg)
+) %>%
+  filter(!is.na(pathway_id), !is.na(pathway_name)) %>%
+  distinct()
+
+cat("Total mappings:", nrow(full_df), "\n")
+head(full_df)
+
+```
+
+saving unmapped kegg ids
+
+```{r}
+unmapped <- kegg_ids[lengths(full_info) == 0]
+write_csv(tibble(unmapped_kegg_id = unmapped), "unmapped_metabolites.csv")
+cat("Unmapped metabolites:", length(unmapped), "of", length(kegg_ids), "\n")
+
+```
+
+Reformatting for pathintegrate
+
+```{r}
+# Reformatting into a matrix that is compatible with pathIntegrate style workflow filling in gaps witrh non
+pathway_list <- full_df %>%
+  group_by(pathway_id, pathway_name) %>%
+  summarise(kegg_ids = list(unique(kegg_id)), .groups = "drop")
+
+max_cols <- max(lengths(pathway_list$kegg_ids))
+
+kegg_matrix <- t(sapply(pathway_list$kegg_ids, function(x) {
+  length(x) <- max_cols
+  x[is.na(x)] <- "None"
+  x
+}))
+
+metab_pathways <- cbind(
+  pathway_id   = pathway_list$pathway_id,
+  pathway_name = pathway_list$pathway_name,
+  as.data.frame(kegg_matrix, stringsAsFactors = FALSE)
+)
+
+write_csv(metab_pathways, "pathintegrate_metabolite_pathways_kegg.csv")
+
+```
+
+# Combining protein and metabolite matrices
+
+```{r}
+library(tidyverse) # sorting 
+
+# Using the KEGG  based metabolite and protein pathay files already created in previous steps
+metab <- read_csv("pathintegrate_metabolite_pathways_kegg.csv", show_col_types = FALSE)
+prot  <- read_csv("pathintegrate_protein_pathways.csv", show_col_types = FALSE)
+
+```
+
+Standardising ID columns
+
+```{r}
+# Rename columns to 0, 1, 2... to account for colnames (pathway id, name)
+rename_id_columns <- function(df) {
+  id_cols <- seq_len(ncol(df) - 2)
+  names(df)[3:ncol(df)] <- as.character(0:(length(id_cols) - 1))
+  return(df)
+}
+
+# apply renaming function to both datasets
+metab <- rename_id_columns(metab)
+prot  <- rename_id_columns(prot)
+
+```
+
+Padding matrices for general width
+
+```{r}
+# Making sure they are the same dimensions for merging
+# calculating the max number of features (columns) across both matrices
+max_cols <- max(ncol(metab), ncol(prot)) - 2
+id_cols <- as.character(0:(max_cols - 1))
+all_colnames <- c("pathway_id", "pathway_name", id_cols)
+
+pad_matrix <- function(df) {
+  current_cols <- ncol(df) - 2
+  if (current_cols < max_cols) {
+    # adding none to gaps in the matrix
+    for (i in (current_cols):(max_cols - 1)) {
+      df[[as.character(i)]] <- "None"
+    }
+  }
+  df <- df[, all_colnames] # reordering too standard layout
+  df[, 3:ncol(df)] <- lapply(df[, 3:ncol(df)], as.character) # ensuring conisstent types of data
+  return(df)
+}
+
+# Applying padding function to both matrices
+metab_fixed <- pad_matrix(metab)
+prot_fixed  <- pad_matrix(prot)
+
+```
+
+Combining pathways
+
+```{r}
+# Binding the padded matrices into one unified dataset where each row is a pathway and columns are associated features
+combined_pathways <- bind_rows(metab_fixed, prot_fixed)
+write_csv(combined_pathways, "pathintegrate_multiomics_pathway_db.csv")
+cat("Combined pathways:", nrow(combined_pathways), "\n")
+cat("Max features per pathway:", max_cols, "\n")
+
+```
+
+Collapsing duplicates and unifying matrix
+
+```{r}
+# Replace `ko` with `map` to prevent duplicates/ make them proper duplicates before filtering them out
+combined <- read_csv("pathintegrate_multiomics_pathway_db.csv", show_col_types = FALSE)
+combined$pathway_id <- gsub("^ko", "map", combined$pathway_id)
+
+# Grouping duplicates
+combined_grouped <- combined %>%
+  group_by(pathway_id, pathway_name) %>%
+  summarise(across(everything(), ~ list(.x)), .groups = "drop")
+
+# Collapsing feature IDs to prevent duplicated features
+collapse_features <- function(row_list) {
+  flat <- unlist(row_list)
+  flat <- flat[flat != "None" & !is.na(flat)]
+  unique(flat)
+}
+# apply collapse to each grouped row
+feature_lists <- lapply(1:nrow(combined_grouped), function(i) {
+  collapse_features(combined_grouped[i, 3:ncol(combined_grouped)])
+})
+# redetermine the max n of features per row after collapsing
+max_len <- max(lengths(feature_lists))
+feature_matrix <- t(sapply(feature_lists, function(x) {
+  length(x) <- max_len
+  x[is.na(x)] <- "None"
+  x
+}))
+# Recombining and saving
+final_matrix <- cbind(
+  pathway_id = combined_grouped$pathway_id,
+  pathway_name = combined_grouped$pathway_name,
+  as.data.frame(feature_matrix, stringsAsFactors = FALSE)
+)
+
+write_csv(final_matrix, "pathintegrate_multiomics_pathway_db_unified.csv")
+write_csv(final_matrix, "Pathway_DB.csv") # So this makes more sense with future pipelines
+
+```
+
+Visualising top pathways
+
+```{r}
+
+# reading in pathway dataframe 
+df <- read_csv("pathintegrate_multiomics_pathway_db_unified.csv", show_col_types = FALSE)
+# rechanging the matrix for useage and readbility into long format
+df_long <- df %>%
+  pivot_longer(cols = -c(pathway_id, pathway_name),
+               names_to = "feature_col", values_to = "feature_id") %>%
+  filter(feature_id != "None", !is.na(feature_id))
+
+# Creating summary table for features per pathway
+summary_table <- df_long %>%
+  group_by(pathway_id, pathway_name) %>%
+  summarise(num_features = n(), .groups = "drop") %>%
+  arrange(desc(num_features))
+
+# Saving for future use
+write_csv(summary_table, "summary_pathway_feature_counts.csv")
+head(summary_table, 20)
+
+```
+
+Barplot of top 20 pathways
+
+```{r}
+
+# Creating a barplot for the visualisation of top 20 pathways
+top20 <- summary_table %>%
+  slice_max(num_features, n = 20)
+
+ggplot(top20, aes(x = reorder(pathway_name, num_features), y = num_features)) +
+  geom_col(fill = "#4682B4") +
+  coord_flip() +
+  labs(title = "Top 20 Pathways by Feature Count",
+       x = "Pathway",
+       y = "Number of Features") +
+  theme_minimal()
+
+```

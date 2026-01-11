@@ -1,0 +1,364 @@
+---
+title: "annottaions"
+format: html
+editor: visual
+---
+
+# Need metabolomics pos and neg pipelines to have run already
+
+## Annotations Positive
+
+Packages
+
+```{r}
+# Install if needed
+install.packages("jsonlite")
+```
+
+Load the JSON File into R
+
+```{r}
+library(jsonlite)
+library(dplyr)
+
+# Load positive mode annotations
+annotations_pos <- fromJSON("C:/Users/samri/Documents/101_bioinformatics/IPA/ipaPy2/annotations_cleaned_allFeatures_pos.json")
+
+# Load negative mode annotations
+annotations_neg <- fromJSON("C:/Users/samri/Documents/101_bioinformatics/IPA/ipaPy2/annotations_cleaned_allFeatures_neg.json")
+
+```
+
+Flatten Both Annotations into DataFrames
+
+```{r}
+# POSITIVE
+annotations_pos_df <- do.call(rbind, lapply(names(annotations_pos), function(feature_id) {
+  df <- annotations_pos[[feature_id]]
+  if (!is.null(df) && nrow(df) > 0) {
+    df$Feature_ID <- feature_id
+    return(df)
+  }
+  return(NULL)
+}))
+
+# NEGATIVE
+annotations_neg_df <- do.call(rbind, lapply(names(annotations_neg), function(feature_id) {
+  df <- annotations_neg[[feature_id]]
+  if (!is.null(df) && nrow(df) > 0) {
+    df$Feature_ID <- feature_id
+    return(df)
+  }
+  return(NULL)
+}))
+
+
+```
+
+Filter to Best Annotation (Per Feature) - POSITIVE
+
+```{r}
+library(dplyr)
+
+# Assuming 'annotations_pos_df' was loaded from the JSON
+best_annotations_pos <- annotations_pos_df %>%
+  group_by(Feature_ID) %>%
+  slice_max(order_by = post, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+```
+
+checking alignment
+
+```{r}
+# Check overlap between annotation and feature matrix
+head(rownames(se_glog))
+head(best_annotations_pos$Feature_ID)
+
+# How many features match?
+sum(best_annotations_pos$Feature_ID %in% rownames(se_glog))
+
+```
+
+Merge annotations with feature info
+
+```{r}
+# First, extract the feature metadata
+features_df <- as.data.frame(rowData(se_glog))  # or use `se_subset` if preferred
+features_df$Feature_ID <- rownames(features_df)  # make Feature_ID column for joining
+
+# Merge with best annotations
+features_with_annotations <- left_join(features_df, best_annotations_pos, by = "Feature_ID")
+# Update rowData in SummarizedExperiment with merged annotations
+rowData(se_glog) <- DataFrame(features_with_annotations[rownames(se_glog), ])
+
+```
+
+check
+
+```{r}
+# View a preview of merged annotation fields
+head(rowData(se_glog))
+
+```
+
+### Negative
+
+```{r}
+# NEGATIVE
+annotations_neg_df <- do.call(rbind, lapply(names(annotations_neg), function(feature_id) {
+  df <- annotations_neg[[feature_id]]
+  if (!is.null(df) && nrow(df) > 0) {
+    df$Feature_ID <- feature_id
+    return(df)
+  }
+  return(NULL)
+}))
+
+```
+
+Select Best Annotation per Feature (Negative)
+
+```{r}
+library(dplyr)
+
+best_annotations_neg <- annotations_neg_df %>%
+  group_by(Feature_ID) %>%
+  slice_max(order_by = post, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+```
+
+merge annotations
+
+```{r}
+# Extract the rowData from SummarizedExperiment
+features_df_neg <- as.data.frame(rowData(se_neg_glog))
+features_df_neg$Feature_ID <- rownames(features_df_neg)  # Add ID column for join
+
+# Merge with annotations
+features_annotated_neg <- left_join(features_df_neg, best_annotations_neg, by = "Feature_ID")
+
+```
+
+Update the SummarizedExperiment Object
+
+```{r}
+# Replace the rowData with merged annotated feature info
+rowData(se_neg_glog) <- DataFrame(features_annotated_neg[rownames(se_neg_glog), ])
+
+```
+
+Final check
+
+```{r}
+head(rowData(se_neg_glog))
+
+```
+
+# Merging data and preparing for pathintegrate
+
+Extract Annotated Expression Data for Positive and Negative
+
+```{r}
+# 1. Extract normalized expression matrix (features x samples)
+expr_pos_mat <- assay(se_glog)  # matrix: rows = features, cols = samples
+
+# 2. Convert to data frame and add feature IDs
+expr_pos_df <- as.data.frame(expr_pos_mat)
+expr_pos_df$Feature_ID <- rownames(expr_pos_mat)
+
+# 3. Bring in annotations
+annot_pos_df <- as.data.frame(rowData(se_glog))
+annot_pos_df$Feature_ID <- rownames(annot_pos_df)
+
+# 4. Merge annotations with expression values
+merged_pos <- left_join(annot_pos_df, expr_pos_df, by = "Feature_ID")
+
+```
+
+Negative mode
+
+```{r}
+# 1. Expression matrix
+expr_neg_mat <- assay(se_neg_glog)
+expr_neg_df <- as.data.frame(expr_neg_mat)
+expr_neg_df$Feature_ID <- rownames(expr_neg_mat)
+
+# 2. Annotations
+annot_neg_df <- as.data.frame(rowData(se_neg_glog))
+annot_neg_df$Feature_ID <- rownames(annot_neg_df)
+
+# 3. Merge
+merged_neg <- left_join(annot_neg_df, expr_neg_df, by = "Feature_ID")
+
+```
+
+Combine both
+
+```{r}
+# Ensure matching columns (e.g., both contain 'Feature_ID', 'id' [ChEBI], and samples)
+common_cols <- intersect(colnames(merged_pos), colnames(merged_neg))
+
+merged_all <- bind_rows(
+  merged_pos[, common_cols],
+  merged_neg[, common_cols]
+)
+
+```
+
+Checking merge
+
+```{r}
+# Peek at the merged data
+head(merged_all)
+colnames(merged_all)
+rownames(merged_all)
+head(merged_all$ids)
+# Check dimensions (rows = total features, columns = annotations + samples)
+dim(merged_all)
+
+# Check that `id` (e.g., ChEBI ID) exists and has meaningful values
+table(is.na(merged_all$id))  # should have many FALSE (non-missing) entries
+
+# Check sample column names
+sample_cols <- setdiff(colnames(merged_all), c("Feature_ID", "id", "name", "formula", "mzs", "RTs", "adduct"))
+head(merged_all[, sample_cols])
+
+```
+
+align chebi if and rownames
+
+```{r}
+# Sanity check that 'id' is ChEBI and not NA
+table(is.na(merged_all$id))  # ideally mostly FALSE
+
+# Filter: keep only rows with valid ChEBI ID
+merged_final <- merged_all[!is.na(merged_all$id), ]
+
+```
+
+check duplicates
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+
+# Count how many times each ID appears
+table(duplicated(merged_final$id))
+
+# Optional: View actual duplicates
+duplicated_ids <- merged_final$id[duplicated(merged_final$id)]
+unique(duplicated_ids)
+
+```
+
+Keep only one row per ID (e.g., highest post score)
+
+```{r}
+# Load necessary package
+library(dplyr)
+
+# Step 1: Keep only the top scoring annotation per ChEBI ID
+merged_final_unique <- merged_final %>%
+  group_by(id) %>%
+  slice_max(order_by = post, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+
+
+```
+
+Filter to conditions
+
+```{r}
+# Step 2: Filter to samples that are only strain A and Next2 is B or C
+
+# Extract metadata from your SummarizedExperiment
+all_metadata <- as.data.frame(colData(se_glog))  # or se_neg_glog if working on neg mode
+
+# Get only samples of interest (Strain A, Next2 = B or C)
+filtered_samples <- all_metadata$id[all_metadata$strain == "A" & all_metadata$Next2 %in% c("B", "C")]
+
+# Confirm these are sample column names in the merged data
+filtered_samples <- intersect(filtered_samples, colnames(merged_final_unique))
+
+```
+
+Remove Extra Annotation Columns
+
+```{r}
+# Step 3: Remove all unwanted annotation columns and keep only filtered samples
+non_sample_cols <- c(
+  "Feature_ID", "id", "name", "formula", "mzs", "RTs", "adduct",
+  "fraction_QCs", "fraction_flag_QCs", "rsd_QC", "rsd_flags", 
+  "m.z", "charge", "RT.range", "ppm", "isotope.pattern.score",
+  "fragmentation.pattern.score", "prior", "post"
+)
+
+# Final sample column set to keep
+sample_cols <- intersect(setdiff(colnames(merged_final_unique), non_sample_cols), filtered_samples)
+
+# Subset matrix to intensity values only
+matrix_path <- merged_final_unique[, sample_cols]
+
+```
+
+Transpose and set chebi ids as colnames
+
+```{r}
+# Step 4: Transpose and assign ChEBI IDs to columns
+matrix_path_t <- as.data.frame(t(matrix_path))
+
+# Set the ChEBI IDs as column names (features)
+colnames(matrix_path_t) <- merged_final_unique$id
+
+# Remove any unexpected row like "ids"
+matrix_path_t <- matrix_path_t[!rownames(matrix_path_t) %in% c("ids"), ]
+
+```
+
+export
+
+```{r}
+# Step 5: Export for PathIntegrate
+write.csv(matrix_path_t, "pathintegrate_ready_metabolomics_filtered.csv", row.names = TRUE)
+
+
+```
+
+# filtering data to just include days 3 and 4
+
+```{r}
+# Step 1: Extract metadata
+metadata <- as.data.frame(colData(se_glog))  # Use se_neg_glog if needed for neg mode too
+
+# Step 2: Filter for Strain A, Next2 B or C, and Day 3 or 4
+filtered_samples_day34 <- metadata$id[
+  metadata$strain == "A" & 
+  metadata$Next2 %in% c("B", "C") &
+  metadata$day %in% c(3, 4)
+]
+
+# Step 3: Ensure those sample names exist in your merged final matrix
+filtered_samples_day34 <- intersect(filtered_samples_day34, colnames(merged_final_unique))
+
+# Step 4: Extract and clean intensity matrix for those samples
+sample_cols_day34 <- intersect(setdiff(colnames(merged_final_unique), non_sample_cols), filtered_samples_day34)
+matrix_path_day34 <- merged_final_unique[, sample_cols_day34]
+
+# Step 5: Transpose and assign ChEBI IDs as column names
+matrix_day34_t <- as.data.frame(t(matrix_path_day34))
+colnames(matrix_day34_t) <- merged_final_unique$id
+
+# Optional cleanup
+matrix_day34_t <- matrix_day34_t[!rownames(matrix_day34_t) %in% c("ids"), ]
+
+# Step 6: Export for PathIntegrate
+write.csv(matrix_day34_t, "pathintegrate_ready_metabolomics_day3_4.csv", row.names = TRUE)
+
+# OPTIONAL: Export metadata for those samples
+metadata_day34 <- metadata[rownames(metadata) %in% filtered_samples_day34, c("day", "strain", "Next2")]
+write.csv(metadata_day34, "metadata_metabolomics_day3_4.csv", row.names = TRUE)
+
+```
+
+# 
