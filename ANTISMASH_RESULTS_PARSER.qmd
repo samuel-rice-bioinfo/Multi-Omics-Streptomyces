@@ -1,0 +1,149 @@
+---
+title: "ANTISMASH"
+format: html
+editor: visual
+---
+
+## ANTISMASH
+
+Parsing the results from antismash to integrate BGCs as part of the pathways database
+
+Parses, extracts BGC reguons and ORFs, maps gene IDs to Uniprot accession, and appends each BGC as a pseudo pathway into the existing pathway database
+
+```{r}
+# Loading libraries
+library(jsonlite) # for robust jason parsing and validation
+library(dplyr)
+library(readr)
+
+# Loading the mapping
+mapping <- read_csv("gene_to_uniprot_mapping.csv")
+
+# Loading full JS file
+js_text <- readLines("regions.js", warn = FALSE)
+full_text <- paste(js_text, collapse = "\n")
+
+# Extracting everything between the first "[" and the first "];" 
+match <- regexpr("\\[.*?\\];", full_text)
+if (match == -1) stop("Could not find array block")
+
+json_array <- regmatches(full_text, match)
+# Removing the trailing semicolon
+json_array <- sub("];$", "]", json_array)
+
+# Parsing JSON
+record_list <- fromJSON(json_array)
+
+```
+
+Checking the record list and diagnosing problems if applicable
+
+```{r}
+str(record_list, max.level = 2)
+```
+
+```{r}
+region_set <- record_list$regions[[1]]
+str(region_set, max.level = 2)
+region_set[[1, "orfs"]]
+orfs <- region_set[[1, "orfs"]][[1]]
+str(orfs, max.level = 2)
+
+```
+
+Extracting all regiouns and ORFs onto a flat table for use
+
+```{r}
+# Flattenning nested structure into a tidy table of ORFs with region metadata 
+# Output columns sconsisting of:
+#   seq_id        : sequence identifier antiSMASH output
+#   region_idx    : numerical index of region within the sequence
+#   region_id     : <sequence_index>.<region_index> for region id
+#   cluster_id    : region identifier stable within antiSMASH report
+#   cluster_type  : antiSMASH region types
+#   gene_id       : ORF locus_tag 
+#   gene_product  : antiSMASH ORF product annotation (could be missing)
+
+df_regions <- do.call(rbind, lapply(seq_len(nrow(record_list)), function(i) {
+  record <- record_list[i, ]
+  # Each of the regions cell is itself a data.frame with a list column
+  region_set <- record$regions[[1]]
+  region_count <- nrow(region_set)
+
+  do.call(rbind, lapply(seq_len(region_count), function(j) {
+    region <- region_set[j, ]
+    # antismash keyss
+    anchor <- region$anchor  
+    type <- region$type      
+    region_id <- paste0(i, ".", j)  
+
+    if (!is.null(region$orfs[[1]]) && is.data.frame(region$orfs[[1]])) {
+      orf_table <- region$orfs[[1]]
+
+      data.frame(
+        seq_id = record$seq_id,
+        region_idx = region$idx,
+        region_id = region_id,
+        cluster_id = anchor,
+        cluster_type = type,
+        gene_id = orf_table$locus_tag,
+        gene_product = orf_table$product,  # optional: remove if unnecessary
+        stringsAsFactors = FALSE
+      )
+    }
+  }))
+}))
+
+
+
+# Mapping the locus tag to uniprot 
+final_mapping <- df_regions %>%
+  left_join(mapping, by = "gene_id")
+
+# Exporting for future use
+write_csv(final_mapping, "mapped_antismash_to_uniprot.csv")
+cat("✅ Mapping complete. Output saved to 'mapped_antismash_to_uniprot.csv'\n")
+
+```
+
+Integrating with pathways db
+
+```{r}
+library(tidyverse)
+
+# Loading original pathway DB that had all of the previously aggregated pathways so we can add the BGCs
+pathway_db <- read_csv("Prokaryotic_Pathway_DB.csv")
+
+# Reading mapped antiSMASH file
+mapped_bgcs <- read_csv("mapped_antismash_to_uniprot.csv")
+
+# Creating synthetic 'Pathway-style' rows per BGC region
+bgc_pathways <- mapped_bgcs %>%
+  filter(!is.na(uniprot_acc)) %>%
+  group_by(cluster_id, cluster_type) %>%
+  summarise(
+    Pathway_id = paste0("BGC_", cluster_id),
+    Pathway_name = paste("antiSMASH:", cluster_type),
+    gene_list = list(sort(unique(uniprot_acc))),  # sorted & deduplicated
+    .groups = "drop"
+  ) %>%
+  mutate(dummy = 1) %>%
+  unnest_wider(gene_list, names_sep = "") %>%
+  select(Pathway_id, Pathway_name, starts_with("gene_list"))
+
+# Fixing column names to match V1, V2, V3...
+colnames(bgc_pathways)[3:ncol(bgc_pathways)] <- paste0("V", seq_len(ncol(bgc_pathways) - 2))
+
+# Removeing duplicate BGC rows (identical UniProt sets)
+bgc_pathways <- distinct(bgc_pathways)
+
+# Combining and replace NA with "None"
+updated_db <- bind_rows(pathway_db, bgc_pathways) %>%
+  mutate(across(everything(), ~replace_na(.x, "None")))
+
+# Saving updated DB
+write_csv(updated_db, "Prokaryotic_Pathway_DB_with_BGCs.csv")
+
+cat("✅ antiSMASH BGCs appended as pathways with duplicates removed and NAs replaced with 'None'.\n")
+
+```

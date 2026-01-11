@@ -1,0 +1,190 @@
+---
+title: "pathintegrate_Transcriptomics"
+format: html
+editor: visual
+---
+
+## Preparing Transcriptomic Data for PathIntegrate
+
+Refining the datasets so that it is 100% compatible with pathintegrate style workflow
+
+This is done seperately from other transcriptomics pipeline for reproducibility and clear separation to prevent any univariate testing adjustments
+
+```{r}
+# Loading libraries
+library(DESeq2)
+library(dplyr)
+library(stringr)
+library(readr)
+library(tibble)
+library(tidyr)
+library(pheatmap)
+```
+
+Loading data
+
+```{r}
+# Loading data
+load("transcriptomics_strainA.RData")
+
+# Assigning clear variable names
+counts_A <- counts
+samples_info_A <- samples_info
+genes_info_A <- genes_info
+
+# Removing .bam suffix from column names for consistency
+colnames(counts_A) <- sub("\\.bam$", "", colnames(counts_A))
+
+```
+
+```{r}
+nrow(counts_A)
+```
+
+Filtering by condition and remove outliers
+
+```{r}
+# Subsetting metadata for comparison groups B vs C
+conditions <- c("B", "C")
+days <- c("3", "4")
+samples_bc_all <- samples_info_A %>%
+  filter(Next2 %in% conditions, day %in% days)
+
+# Defining and removing known outlier samples
+outliers <- c("3-1_2c_S16", "3-1_2b_S15", "2-4_2_S10")
+samples_bc_all <- samples_bc_all %>%
+  filter(!Snames %in% outliers)
+
+# Subsetting counts matrix accordingly
+counts_bc_all <- counts_A[, colnames(counts_A) %in% samples_bc_all$Snames]
+
+```
+
+Normalisation
+
+```{r}
+# Building DESeq2 object with basic design
+dds_bc_all <- DESeqDataSetFromMatrix(
+  countData = counts_bc_all,
+  colData = samples_bc_all,
+  design = ~ day + Next2
+)
+
+# Applying VST for variance-stabilised expression
+vsd <- vst(dds_bc_all, blind = TRUE)
+
+# Extracting transformed expression matrix
+expr_vst <- assay(vsd)
+
+```
+
+Loading diamond hits
+
+```{r}
+# Loading DIAMOND BLAST hits and extractting UniProt accessions
+diamond_hits <- read_tsv("diamond_results.tsv", col_names = c(
+  "gene_id", "uniprot_hit", "pident", "evalue", "bitscore"
+)) %>%
+  mutate(uniprot_acc = str_extract(uniprot_hit, "(?<=\\|)[A-Z0-9]+(?=\\|)"))
+
+```
+
+Format raw counts for merging
+
+```{r}
+# Converting expression to data frame and adding gene id
+expr_df <- as.data.frame(expr_vst)
+expr_df$gene_id <- rownames(expr_df)
+
+# Mergeing VST data with UniProt mapping
+merged_expr <- expr_df %>%
+  left_join(diamond_hits %>% select(gene_id, uniprot_acc, bitscore), by = "gene_id") %>%
+  filter(!is.na(uniprot_acc))
+
+```
+
+Checking diamond structure
+
+```{r}
+head(diamond_hits)
+str(diamond_hits)
+
+head(rownames(counts_A))
+str(counts_A)
+head(rownames(counts_A))
+
+```
+
+Merging
+
+```{r}
+# Converting expression to data frame and add gene_id
+expr_df <- as.data.frame(expr_vst)
+expr_df$gene_id <- rownames(expr_df)
+
+# Mergeing VST data with UniProt mapping
+merged_expr <- expr_df %>%
+  left_join(diamond_hits %>% select(gene_id, uniprot_acc, bitscore), by = "gene_id") %>%
+  filter(!is.na(uniprot_acc))
+
+```
+
+checking merge
+
+```{r}
+# % mapped
+mean(!is.na(merged_expr$uniprot_acc))
+
+```
+
+Selecting highest bitscore match
+
+```{r}
+best_gene_per_protein <- merged_expr %>%
+  group_by(uniprot_acc) %>%
+  slice_max(order_by = bitscore, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+```
+
+changing matrix to uniprot ids
+
+```{r}
+# Keep only expression columns
+sample_cols <- colnames(expr_vst)
+expr_protein <- as.data.frame(best_gene_per_protein[, c("uniprot_acc", sample_cols)])
+
+# Set UniProt as rownames
+rownames(expr_protein) <- expr_protein$uniprot_acc
+expr_protein <- expr_protein[, -1]  # drop uniprot_acc
+
+```
+
+Formatting for pathintegrate:
+
+```{r}
+# Transposing to samples as rows, UniProt IDs as columns
+expr_matrix <- as.data.frame(t(expr_protein))
+expr_matrix$sample_id <- rownames(expr_matrix)
+expr_matrix <- expr_matrix %>% relocate(sample_id)
+
+```
+
+export to csv
+
+```{r}
+write.csv(expr_matrix, "Transcriptomic_PathIntegrate_RDY.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Extractting mapping of gene_id to UniProt accession
+gene_to_uniprot <- diamond_hits %>%
+  select(gene_id, uniprot_acc) %>%
+  filter(!is.na(uniprot_acc)) %>%
+  distinct()
+
+# Saving mapping table
+write.csv(gene_to_uniprot, "gene_to_uniprot_mapping.csv", row.names = FALSE)
+
+```

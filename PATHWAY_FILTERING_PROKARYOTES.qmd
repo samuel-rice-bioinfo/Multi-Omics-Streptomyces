@@ -1,0 +1,45 @@
+---
+title: "Pathway filtering Prokaryotes"
+format: html
+editor: visual
+---
+
+## Filtering pathways- Prokaryotes
+
+Retrieve all the prokaryotic codes, filtering based on a list of prokaryotic pathways retrieved online
+
+```{r}
+# Loading libraries
+library(readr)
+library(dplyr)
+library(stringr)
+
+# Loading the curated prokaryotic pathways
+prok_list <- read_csv("Prokaryotic_KEGG_List.csv", col_names = FALSE)
+prok_list <- prok_list$X1
+
+# Extractingg only numeric pathway codes i.e. the 5-digit KEGG IDs
+prok_ids <- str_extract_all(prok_list, "\\b\\d{5}\\b") %>%
+  unlist() %>%
+  unique()
+
+# Prefix the codes with "map" to get standard KEGG pathway IDs
+valid_kegg_paths <- paste0("map", prok_ids)
+
+# Loading pathway database
+pathway_db <- read_csv("Pathway_DB.csv")
+
+# Filtering based on valid prokaryotic pathways
+filtered_db <- pathway_db %>%
+  filter(Pathway_id %in% valid_kegg_paths)
+
+# Saving the cleaned file that now contains the prokaryotic pathways only
+write_csv(filtered_db, "Prokaryotic_Pathway_DB.csv")
+
+cat("✅ Done! Filtered", nrow(filtered_db), "rows from", nrow(pathway_db), "original entries.\n")
+
+```
+
+### Additional notes
+
+This database was further filtered manually due to certain prokaryotic pathways containing human-centric pathways that are involved with prokaryotes but centred arround human disease and eukaryotic response.

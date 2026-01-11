@@ -1,0 +1,669 @@
+# Differential Gene Expression Analysis
+
+Samuel Rice
+
+## Introduction
+
+The changes in gene expression of strain A across different Next 2 conditions (B, C, D) when compared to the control (A) were analysed using DESeq2. The significant genes were visualised using volcano plots and heatmaps. The data was further analysed using PCA to check cluster distribution and identify outlines.
+
+#### Loading libraries
+
+```{r}
+# Load necessary libraries
+library(DESeq2)   # Differential expression analysis
+library(ggplot2)  # Data visualization
+library(dplyr)    # Data manipulation
+library(tibble)   # Data frame enhancements
+library(readr)    # Reading and writing data
+library(pheatmap) # Heatmaps
+library(stringr)  # String manipulation
+
+```
+
+#### Data loading and cleaning
+
+-   Load data and assigning new names to files
+
+-   Removing .bam to allow the counts matrix to align with Snames in sample info.
+
+-   Removing outlier- earlier identified using PCA and heatmaps.
+
+-   Data check- debugging step to check sample groups to ensure experimental design
+
+### Loading and preparing data
+
+```{r}
+# Load pre-processed transcriptomics data for Strain A
+load("transcriptomics_strainA.RData")
+
+# Rename for clarity
+counts_A <- counts
+samples_info_A <- samples_info
+genes_info_A <- genes_info
+
+# Remove .bam suffixes from sample names in count matrix
+colnames(counts_A) <- sub("\\.bam$", "", colnames(counts_A))
+
+```
+
+Subsetting data for day 3 Next2 B vs C
+
+```{r}
+# Define comparison groups and subset metadata
+conditions <- c("B", "C")
+samples_bc_all <- samples_info_A %>%
+  filter(Next2 %in% conditions)
+
+# Subset count matrix
+keep_samples_bc <- samples_bc_all$Snames
+counts_bc_all <- counts_A[, colnames(counts_A) %in% keep_samples_bc]
+
+```
+
+Removing Outliers
+
+```{r}
+# Remove outliers
+outliers <- c("3-1_2c_S16", "3-1_2b_S15", "2-4_2_S10")
+samples_bc_all <- samples_bc_all %>% filter(!Snames %in% outliers)
+counts_bc_all <- counts_bc_all[, colnames(counts_bc_all) %in% samples_bc_all$Snames]
+
+```
+
+### DESeq2
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(tibble)
+# Create DESeq2 object for B vs C across days
+dds_bc_all <- DESeqDataSetFromMatrix(
+  countData = counts_bc_all,
+  colData = samples_bc_all,
+  design = ~ day + Next2
+)
+
+# Drop unused factor levels
+dds_bc_all$Next2 <- droplevels(dds_bc_all$Next2)
+
+# Run LRT: full model = day + Next2, reduced = day
+dds_bc_all <- DESeq(dds_bc_all, test = "LRT", reduced = ~ day)
+
+# Extract results
+res_lrt_bc <- results(dds_bc_all)
+
+# Filter for significant genes
+sig_lrt_bc <- as.data.frame(res_lrt_bc) %>%
+  rownames_to_column("gene_id") %>%
+  filter(padj < 0.05)
+res_lrt_bc_df <- rownames_to_column(as.data.frame(res_lrt_bc), "gene_id")
+
+```
+
+Differential expression results
+
+```{r}
+if (!requireNamespace("EnhancedVolcano", quietly = TRUE)) {
+    install.packages("BiocManager")
+    BiocManager::install("EnhancedVolcano")
+}
+
+library(EnhancedVolcano)
+
+```
+
+Volcano plot
+
+```{r}
+EnhancedVolcano(res_lrt_bc_df,
+    lab = res_lrt_bc_df$gene_id,
+    x = 'log2FoldChange',
+    y = 'padj',
+    xlim = c(-5, 5),
+    title = 'Volcano Plot: Next2 B vs C (LRT)',
+    subtitle = 'Across all days',
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 3.0,
+    labSize = 3.5,
+    colAlpha = 0.7,
+    legendPosition = 'right',
+    legendLabSize = 12,
+    legendIconSize = 4.0
+)
+
+```
+
+### PCA
+
+```{r}
+vsd <- vst(dds_bc_all, blind = FALSE)  # or rlog(), but vst is faster for large datasets
+
+plotPCA(vsd, intgroup = c("Next2", "day"))
+
+
+```
+
+Advanced PCA with ggplot
+
+```{r}
+# Compute PCA
+pca_data <- plotPCA(vsd, intgroup = c("Next2", "day"), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+# Plot with ggplot2
+ggplot(pca_data, aes(PC1, PC2, color = Next2, shape = day)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal() +
+  ggtitle("PCA: Next2 B vs C across days")
+
+```
+
+Exploring other PCA libraries
+
+```{r}
+library(factoextra)
+fviz_pca_ind(prcomp(t(assay(vsd))), label = "none",
+             habillage = samples_bc_all$Next2, addEllipses = TRUE)
+
+```
+
+Annotation of significant genes
+
+```{r}
+library(readr)
+library(stringr)
+# Load Diamond hits (if not already loaded)
+diamond_hits <- read_tsv("diamond_results.tsv", col_names = c(
+  "gene_id", "uniprot_hit", "pident", "evalue", "bitscore"
+)) %>%
+  mutate(uniprot_acc = str_extract(uniprot_hit, "(?<=\\|)[A-Z0-9]+(?=\\|)"))
+
+# Annotate LRT results: add protein hits and gene product info
+sig_lrt_bc_annot <- sig_lrt_bc %>%
+  left_join(diamond_hits, by = "gene_id") %>%
+  left_join(genes_info_A %>% select(gene_id = locus_tag, product), by = "gene_id")
+
+
+```
+
+checking merge
+
+```{r}
+table(is.na(sig_lrt_bc_annot$uniprot_acc))
+head(sig_lrt_bc_annot[!is.na(sig_lrt_bc_annot$uniprot_acc), c("gene_id", "uniprot_acc", "product")], 10)
+table(duplicated(sig_lrt_bc_annot$uniprot_acc[!is.na(sig_lrt_bc_annot$uniprot_acc)]))
+
+```
+
+![](images/clipboard-917260700.png)
+
+Saving
+
+```{r}
+write_csv(sig_lrt_bc_annot, "sig_lrt_bc_annotated.csv")
+head(sig_lrt_bc_annot)
+dim(sig_lrt_bc_annot)
+```
+
+Exporting results for david
+
+```{r}
+sig_lrt_bc_annot %>%
+  filter(!is.na(uniprot_acc)) %>%
+  pull(uniprot_acc)
+
+write_lines(sig_lrt_bc_annot$uniprot_acc[!is.na(sig_lrt_bc_annot$uniprot_acc)], "lrt_sig_uniprot.txt")
+
+```
+
+### Loading David results
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+
+# Load the DAVID chart report (already processed with LRT gene list)
+david_lrt_results <- read_tsv("lrt_david_chart_report.txt")
+
+names(david_lrt_results)
+
+```
+
+Gene to term mapping
+
+```{r}
+# Create a new data frame by splitting and repeating
+term_list <- list()
+acc_list <- list()
+
+for (i in seq_len(nrow(david_lrt_results))) {
+  term <- david_lrt_results$Term[i]
+  gene_ids <- unlist(strsplit(david_lrt_results$Genes[i], ","))
+  gene_ids <- trimws(gene_ids)
+  
+  term_list[[i]] <- rep(term, length(gene_ids))
+  acc_list[[i]] <- gene_ids
+}
+
+# Combine into flat data frame
+david_lrt_mapping <- data.frame(
+  uniprot_acc = unlist(acc_list),
+  Term = unlist(term_list),
+  stringsAsFactors = FALSE
+)
+
+```
+
+Merging with annotated LRT results
+
+```{r}
+sig_lrt_bc_annot <- merge(
+  sig_lrt_bc_annot,
+  david_lrt_mapping,
+  by = "uniprot_acc",
+  all.x = TRUE  # left join: keep all DE genes, add terms if available
+)
+
+```
+
+check merge
+
+```{r}
+# Look at some annotated rows
+head(sig_lrt_bc_annot[!is.na(sig_lrt_bc_annot$Term), c("gene_id", "uniprot_acc", "Term")], 10)
+
+
+
+# Count how many were annotated
+table(is.na(sig_lrt_bc_annot$Term))
+
+```
+
+## Plotting Heatmap
+
+```{r}
+vsd <- vst(dds_bc_all, blind = FALSE)  # if not already done
+expr_matrix <- assay(vsd)  # genes x samples
+
+```
+
+subset significance
+
+```{r}
+# Keep only rows that are significant
+sig_genes <- sig_lrt_bc_annot$gene_id
+expr_sig <- expr_matrix[rownames(expr_matrix) %in% sig_genes, ]
+
+```
+
+create gene label column
+
+```{r}
+# Match rows of expression matrix with annotations
+gene_annotations <- sig_lrt_bc_annot[match(rownames(expr_sig), sig_lrt_bc_annot$gene_id), ]
+
+# Prefer product name if available
+gene_labels <- ifelse(!is.na(gene_annotations$product), gene_annotations$product, gene_annotations$uniprot_acc)
+rownames(expr_sig) <- gene_labels
+
+```
+
+rename columns with condition info
+
+```{r}
+# Keep original sample names as column names
+# We'll annotate with metadata instead
+colnames(expr_sig)  # should be something like "3-1_2b_S15", etc.
+
+# Match to sample info
+sample_metadata <- samples_info_A[match(colnames(expr_sig), samples_info_A$Snames), ]
+
+# Build annotation_col with unique rownames
+annotation_col <- data.frame(
+  Next2 = sample_metadata$Next2,
+  day = as.factor(sample_metadata$day)
+)
+rownames(annotation_col) <- sample_metadata$Snames  # these are unique!
+
+```
+
+create annotation column
+
+```{r}
+# Use original colnames to extract sample info again
+sample_metadata <- samples_info_A[match(colnames(expr_sig), samples_info_A$Snames), ]
+
+# Build annotation frame
+annotation_col <- data.frame(
+  Next2 = sample_metadata$Next2,
+  day = as.factor(sample_metadata$day)
+)
+rownames(annotation_col) <- colnames(expr_sig)
+
+```
+
+creating colour scheme
+
+```{r}
+ann_colors <- list(
+  Next2 = c("B" = "red", "C" = "blue"),
+  day = c("2" = "lightgrey", "3" = "darkgrey", "4" = "black")
+)
+annotation_col$day <- factor(annotation_col$day, levels = c("2", "3", "4"))
+
+annotation_col[is.na(annotation_col$day), ]
+
+annotation_col$day[is.na(annotation_col$day)] <- "4"
+
+```
+
+plotting
+
+```{r}
+pheatmap::pheatmap(
+  expr_sig,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = "row",  # Optional: makes intensities comparable across genes
+  show_rownames = FALSE,
+  annotation_col = annotation_col,   # Keeps Next2 and day coloring
+  annotation_colors = ann_colors,   # Your custom color scheme
+  fontsize_row = 8,
+  fontsize_col = 10,
+  main = "LRT-Significant DEGs: Next2 B vs C Across Days"
+)
+
+```
+
+Saving as a PNG
+
+```{r}
+png("heatmap_plot.png", width = 1200, height = 1000, res = 150)
+pheatmap::pheatmap(
+  expr_sig,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = "row",
+  show_rownames = FALSE,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  fontsize_row = 8,
+  fontsize_col = 10,
+  main = "LRT-Significant DEGs: Next2 B vs C Across Days"
+)
+dev.off()
+
+```
+
+## Visualising David results
+
+Filtering results
+
+```{r}
+# Convert FDR to numeric in case it's character
+david_lrt_results$FDR <- as.numeric(david_lrt_results$FDR)
+
+# Select top 10 by FDR
+top_terms <- david_lrt_results[order(david_lrt_results$FDR), ][1:10, ]
+
+# Add log FDR for plotting
+top_terms$logFDR <- -log10(top_terms$FDR)
+
+```
+
+Barplot
+
+```{r}
+library(ggplot2)
+
+ggplot(top_terms, aes(x = reorder(Term, logFDR), y = logFDR)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Enriched DAVID Terms",
+    x = "Term",
+    y = expression(-log[10](FDR))
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+### Splitting proteins for conditions to upload to DAVID
+
+```{r}
+# Upregulated in B
+up_in_B <- sig_lrt_bc_annot[sig_lrt_bc_annot$log2FoldChange > 0 & !is.na(sig_lrt_bc_annot$uniprot_acc), ]
+
+# Upregulated in C
+up_in_C <- sig_lrt_bc_annot[sig_lrt_bc_annot$log2FoldChange < 0 & !is.na(sig_lrt_bc_annot$uniprot_acc), ]
+
+```
+
+exporting for david
+
+```{r}
+writeLines(up_in_B$uniprot_acc, "up_in_B_uniprot.txt")
+writeLines(up_in_C$uniprot_acc, "up_in_C_uniprot.txt")
+
+```
+
+Getting results from the LRT
+
+Identifying which day derived the most DEGs
+
+```{r}
+# Expression matrix of sig genes (already scaled)
+expr_sig_scaled <- t(scale(t(expr_sig)))  # genes x samples
+
+# Add metadata
+sample_info <- annotation_col
+sample_info$sample <- rownames(sample_info)
+long_expr <- reshape2::melt(expr_sig_scaled)
+colnames(long_expr) <- c("gene", "sample", "expression")
+long_expr <- merge(long_expr, sample_info, by.x = "sample", by.y = "sample")
+
+# Compute mean expression per gene per group
+library(dplyr)
+gene_day_diff <- long_expr %>%
+  group_by(gene, day, Next2) %>%
+  summarize(mean_expr = mean(expression), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Next2, values_from = mean_expr) %>%
+  mutate(diff = B - C)
+
+# Now compute per-day absolute difference
+gene_day_summary <- gene_day_diff %>%
+  group_by(day) %>%
+  summarize(mean_abs_diff = mean(abs(diff)), .groups = "drop")
+library(ggplot2)
+# Plot: which day has most gene-level differences?
+ggplot(gene_day_summary, aes(x = day, y = mean_abs_diff)) +
+  geom_col(fill = "tomato") +
+  theme_minimal() +
+  labs(title = "Day-specific expression separation (B vs C)",
+       y = "Mean |log2FC| in DEGs", x = "Day")
+
+```
+
+Top genes driving LRT signal per day
+
+```{r}
+top_genes_day3 <- gene_day_diff %>%
+  filter(day == 3) %>%
+  arrange(desc(abs(diff))) %>%
+  head(20)
+
+```
+
+POSTER STATS
+
+```{r}
+# 1. Total genes analyzed
+total_genes <- nrow(res_lrt_bc_df)
+
+# 2. DEGs (adj p < 0.05)
+num_degs <- nrow(sig_lrt_bc)
+
+# 3. Upregulated in each condition
+up_in_B <- sum(sig_lrt_bc$log2FoldChange > 0, na.rm = TRUE)
+up_in_C <- sum(sig_lrt_bc$log2FoldChange < 0, na.rm = TRUE)
+
+# 4. Top enriched DAVID term (lowest FDR)
+top_term <- david_lrt_results$Term[which.min(as.numeric(david_lrt_results$FDR))]
+
+# 5. Day with most gene-level expression difference
+day_max_diff <- gene_day_summary$day[which.max(gene_day_summary$mean_abs_diff)]
+
+# 6. PCA variance (from vsd)
+pca_data <- plotPCA(vst(dds_bc_all, blind = FALSE), intgroup = c("Next2", "day"), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+pc1_var <- percentVar[1]
+pc2_var <- percentVar[2]
+
+# Output for poster
+cat("Total genes analyzed:", total_genes, "\n")
+cat("Significant DEGs (adj p < 0.05):", num_degs, "\n")
+cat("Upregulated in B:", up_in_B, "\n")
+cat("Upregulated in C:", up_in_C, "\n")
+cat("Top DAVID term:", top_term, "\n")
+cat("Day with largest expression separation:", day_max_diff, "\n")
+cat("PCA Variance Explained: PC1 =", pc1_var, "%, PC2 =", pc2_var, "%\n")
+
+```
+
+DAVID VISUALISATION
+
+```{r}
+make_combined_david_barplot <- function(file_B, file_C, top_n = 5, output_file = "combined_david_barplot.png") {
+  library(dplyr)
+  library(ggplot2)
+  library(readr)
+  
+  # Load and process Next2 B
+  df_B <- read_csv(file_B) %>%
+    filter(PValue < 0.05) %>%
+    arrange(PValue) %>%
+    slice_head(n = top_n) %>%
+    mutate(Condition = "Next2 B")
+  
+  # Load and process Next2 C
+  df_C <- read_csv(file_C) %>%
+    filter(PValue < 0.05) %>%
+    arrange(PValue) %>%
+    slice_head(n = top_n) %>%
+    mutate(Condition = "Next2 C")
+  
+  # Combine and clean up term names
+  combined_df <- bind_rows(df_B, df_C) %>%
+    mutate(
+      Term = ifelse(
+        grepl("GO:0016705~oxidoreductase activity", Term),
+        "GO:0016705~oxidoreductase activity",
+        Term
+      )
+    ) %>%
+    mutate(Term = factor(Term, levels = unique(Term[order(Fold_Enrichment)])))
+
+  # Plot
+  barplot <- ggplot(combined_df, aes(x = Fold_Enrichment, y = Term, fill = Condition)) +
+    geom_col(position = position_dodge(width = 0.7)) +
+    labs(
+      title = "Top Enriched Biological Terms from DAVID",
+      x = "Fold Enrichment",
+      y = "Biological Term"
+    ) +
+    theme_minimal(base_size = 14) +  # Increase overall base font size
+    scale_fill_manual(values = c("Next2 B" = "red", "Next2 C" = "blue")) +
+    theme(
+      legend.position = "top",
+      axis.text.y = element_text(size = 10),     # Adjust term label size
+      axis.text.x = element_text(size = 10),     # Adjust x-axis label size
+      legend.text = element_text(size = 12),
+      plot.title = element_text(size = 12, face = "bold")
+    )
+  
+  ggsave(output_file, plot = barplot, width = 11, height = 6)
+  return(barplot)
+}
+
+```
+
+```{r}
+make_combined_david_barplot(
+  file_B = "DAVID_clustered_B_clean.csv",
+  file_C = "DAVID_clustered_C_clean.csv",
+  top_n = 10,
+  output_file = "combined_david_barplot_updated.png"
+)
+
+```
+
+# Preparing PathIntegrate Input
+
+Build expression matrix with UniProt IDs
+
+```{r}
+# Annotate all gene_ids with UniProt IDs
+all_annot <- data.frame(gene_id = rownames(vsd)) %>%
+  left_join(diamond_hits, by = "gene_id")
+
+# Only keep those with UniProt accession
+vsd_filtered <- assay(vsd)[rownames(vsd) %in% all_annot$gene_id, ]
+rownames(vsd_filtered) <- all_annot$uniprot_acc[match(rownames(vsd_filtered), all_annot$gene_id)]
+vsd_filtered <- vsd_filtered[!is.na(rownames(vsd_filtered)), ]
+
+```
+
+Build Binary Metadata for B vs C
+
+```{r}
+# Create binary class (B = 1, C = 0)
+metadata_binary <- ifelse(samples_bc_all$Next2 == "B", 1, 0)
+names(metadata_binary) <- samples_bc_all$Snames
+
+```
+
+Save to csv for python use
+
+```{r}
+# Write expression matrix and metadata for Python/Colab use
+write.csv(vsd_filtered, "transcriptomics_expr_matrix_uniprot.csv")
+write.csv(data.frame(sample = names(metadata_binary), condition = metadata_binary),
+          "transcriptomics_metadata_binary.csv", row.names = FALSE)
+
+```
+
+# filtering to days 3 and 4 for pathintegrate
+
+```{r}
+# Step 1: Get metadata from vsd colData
+vsd_meta <- as.data.frame(colData(vsd))
+
+# Step 2: Filter to Day 3 and 4 + Strain A + Next2 B or C
+vsd_meta_day34 <- vsd_meta %>%
+  filter(day %in% c(3, 4), Next2 %in% c("B", "C"))
+
+# Step 3: Subset expression matrix
+vsd_day34 <- assay(vsd)[, rownames(vsd_meta_day34)]
+
+# Step 4: Map gene IDs to UniProt (if not done yet)
+all_annot_day34 <- data.frame(gene_id = rownames(vsd_day34)) %>%
+  left_join(diamond_hits, by = "gene_id")
+
+vsd_day34_filtered <- vsd_day34[rownames(vsd_day34) %in% all_annot_day34$gene_id, ]
+rownames(vsd_day34_filtered) <- all_annot_day34$uniprot_acc[match(rownames(vsd_day34_filtered), all_annot_day34$gene_id)]
+vsd_day34_filtered <- vsd_day34_filtered[!is.na(rownames(vsd_day34_filtered)), ]
+
+# Step 5: Transpose and write to CSV for PathIntegrate
+vsd_day34_t <- as.data.frame(t(vsd_day34_filtered))
+write.csv(vsd_day34_t, "transcriptomics_day3_4_uniprot.csv", row.names = TRUE)
+
+# Step 6: Save metadata for plotting/interpretation
+metadata_day34 <- vsd_meta_day34[, c("Next2", "day")]
+write.csv(metadata_day34, "metadata_transcriptomics_day3_4.csv", row.names = TRUE)
+
+```
